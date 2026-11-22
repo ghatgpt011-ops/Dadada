@@ -27,7 +27,7 @@ state = {
     "status": "در حال راه‌اندازی...",
     "ping": "قطع",
     "auth_status": "disconnected",  # disconnected | code_sent | connected
-    "auth_msg": "در حال بررسی وضعیت اتصال...",
+    "auth_msg": "شماره تلفن را وارد کنید (مثال: +98912...)",
     "phone": "",
 }
 
@@ -164,7 +164,8 @@ async def _do_send_code(phone: str):
     global client, force_reconnect, client_ready
     async with connect_lock:
         state["phone"] = phone
-        state["auth_msg"] = "در حال ارسال کد..."
+        state["auth_status"] = "code_sent"
+        state["auth_msg"] = "در حال ارسال کد... در صورت دریافت کد آن را وارد کنید."
         try:
             client_ready = False
             await _close_client_safely(client)
@@ -177,14 +178,15 @@ async def _do_send_code(phone: str):
             else:
                 await client.sign_in(phone=phone)
             state["auth_status"] = "code_sent"
-            state["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
+            state["auth_msg"] = "کد ارسال شد؛ کد را در کادر زیر وارد کنید."
         except Exception as e:
-            state["auth_status"] = "disconnected"
-            state["auth_msg"] = f"خطا در ارسال کد: {e}"
+            state["auth_status"] = "code_sent"
+            state["auth_msg"] = f"اگر کد آمد وارد کنید (پیام: {e})"
 
 
 async def _do_verify_code(code: str):
     global force_reconnect
+    state["auth_status"] = "code_sent"
     state["auth_msg"] = "در حال بررسی کد..."
     try:
         if hasattr(client, "sign_in"):
@@ -195,7 +197,7 @@ async def _do_verify_code(code: str):
 
         sess = client.session.save() if getattr(client, "session", None) else ""
         if not sess:
-            raise RuntimeError("سشن ذخیره نشد.")
+            raise RuntimeError("سشن ذخیره نشد؛ کد را دوباره بررسی کنید.")
         save_session_str(sess)
         state["auth_status"] = "connected"
         state["auth_msg"] = "ورود موفق انجام شد؛ در حال اتصال..."
@@ -231,7 +233,7 @@ PANEL_HTML = """<!DOCTYPE html>
   .mini { width: auto; padding: 5px 10px; font-size: 12px; margin-top: 0; }
   .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
   .card { background: #121212; border: 1px solid #2e2e2e; border-radius: 6px; padding: 8px; margin-top: 8px; font-size: 12px; line-height: 1.7; }
-  .small { font-size: 12px; color: #bbb; margin-top: 6px; }
+  .small { font-size: 12px; color: #bbb; margin-top: 6px; word-break: break-word; }
   .groups { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; max-height: 100px; overflow-y: auto; }
   .gbtn { width: auto; margin: 0; padding: 4px 8px; font-size: 11px; background: #252525; border: 1px solid #3d3d3d; }
 </style>
@@ -288,6 +290,8 @@ PANEL_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+let manualCodeBox = false;
+
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function addText(){
@@ -309,12 +313,18 @@ function getTexts(){
 async function sendPhone(){
   const p = document.getElementById('phone').value.trim();
   if(!p) return alert('شماره را وارد کن');
+  manualCodeBox = true;
+  document.getElementById('code_box').style.display = 'block';
+  document.getElementById('auth_msg').innerText = 'در حال ارسال کد... کد را در کادر زیر وارد کنید.';
   await fetch('/api/send_phone?phone=' + encodeURIComponent(p));
+  setTimeout(tick, 600);
 }
 async function sendCode(){
   const c = document.getElementById('code').value.trim();
   if(!c) return alert('کد را وارد کن');
+  document.getElementById('auth_msg').innerText = 'در حال بررسی کد...';
   await fetch('/api/verify_code?code=' + encodeURIComponent(c));
+  setTimeout(tick, 800);
 }
 
 async function loadGroups(){
@@ -383,7 +393,9 @@ async function tick(){
     document.getElementById('ping').innerText = d.ping;
     document.getElementById('status_txt').innerText = d.status;
     document.getElementById('auth_msg').innerText = d.auth_msg;
-    document.getElementById('code_box').style.display = (d.auth_status === 'code_sent') ? 'block' : 'none';
+    if(d.auth_status === 'connected'){ manualCodeBox = false; }
+    const showCode = manualCodeBox || (d.auth_status === 'code_sent');
+    document.getElementById('code_box').style.display = showCode ? 'block' : 'none';
     renderJobs(d.jobs || []);
   }catch(e){}
 }
@@ -428,6 +440,9 @@ def health_page():
 def api_send_phone():
     p = (request.args.get("phone") or "").strip()
     if p:
+        state["phone"] = p
+        state["auth_status"] = "code_sent"
+        state["auth_msg"] = "در حال ارسال کد... کد را وارد کنید."
         run_in_bot_loop(_do_send_code(p))
     return "", 200
 
@@ -642,8 +657,9 @@ async def connection_loop():
                 if not sess:
                     client_ready = False
                     state["ping"] = "قطع"
-                    state["auth_status"] = "disconnected"
-                    state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
+                    if state.get("auth_status") != "code_sent":
+                        state["auth_status"] = "disconnected"
+                        state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
                     state["status"] = "منتظر ورود شماره..."
                     await asyncio.sleep(1.5)
                     continue
@@ -690,8 +706,9 @@ async def connection_loop():
         except Exception as e:
             client_ready = False
             state["ping"] = "قطع"
-            state["auth_status"] = "disconnected"
-            state["auth_msg"] = f"اتصال قطع است ({e})"
+            if state.get("auth_status") != "code_sent":
+                state["auth_status"] = "disconnected"
+                state["auth_msg"] = f"اتصال قطع است ({e})"
             state["status"] = f"تلاش برای اتصال مجدد: {e}"
             await _close_client_safely(client)
             await asyncio.sleep(3)
