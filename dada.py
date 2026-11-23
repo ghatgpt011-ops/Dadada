@@ -12,7 +12,7 @@ from flask import Flask, request
 from splusthon import SoroushClient
 from splusthon.sessions import StringSession
 
-# ================= تنظیمات ساده =================
+# ================= تنظیمات =================
 SESSION_FILE = "soroush_session.txt"
 JOBS_FILE = "spam_jobs.json"
 PORT = int(os.environ.get("PORT", 8080))
@@ -25,7 +25,7 @@ job_seq = 0
 
 state = {
     "status": "در حال راه‌اندازی...",
-    "ping": "قطع",
+    "ping": "در حال بررسی...",
     "auth_status": "disconnected",  # disconnected | code_sent | connected
     "auth_msg": "شماره تلفن را وارد کنید (مثال: +98912...)",
     "phone": "",
@@ -34,7 +34,8 @@ state = {
 client = SoroushClient(StringSession())
 group_list = []
 bot_loop = None
-force_reconnect = False
+phone_code_hash = None
+login_in_progress = False
 client_ready = False
 connect_lock = asyncio.Lock()
 
@@ -70,8 +71,12 @@ def load_jobs():
                 if isinstance(raw, list):
                     spam_jobs = raw
                     for j in spam_jobs:
+                        j["idx"] = int(j.get("idx") or 0)
+                        j["sent"] = int(j.get("sent") or 0)
+                        j["max_count"] = int(j.get("max_count") or 0)
+                        j["speed"] = max(0.01, float(j.get("speed") or 1.0))
                         if j.get("running"):
-                            j["last_status"] = "بازیابی پس از ری‌استارت..."
+                            j["last_status"] = "ادامه خودکار تسک..."
                             j["last_err"] = ""
                     job_seq = len(spam_jobs)
         except Exception:
@@ -138,7 +143,7 @@ def parse_texts(encoded: str) -> list:
 load_jobs()
 
 
-# ================= مدیریت اتصال و احراز هویت =================
+# ================= مدیریت کلاینت و لاگین =================
 async def _close_client_safely(c):
     if c is None:
         return
@@ -160,48 +165,147 @@ async def _close_client_safely(c):
             pass
 
 
-async def _do_send_code(phone: str):
-    global client, force_reconnect, client_ready
+def _extract_code_hash(sent_obj, phone: str):
+    if sent_obj is not None:
+        h = getattr(sent_obj, "phone_code_hash", None)
+        if h:
+            return str(h)
+        if isinstance(sent_obj, dict) and sent_obj.get("phone_code_hash"):
+            return str(sent_obj["phone_code_hash"])
+    for attr in ("_phone_code_hash", "phone_code_hash", "code_hash"):
+        val = getattr(client, attr, None)
+        if isinstance(val, dict) and phone in val:
+            return str(val[phone])
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+async def _ensure_live_session(force_fresh: bool = False) -> bool:
+    global client, client_ready
+    if login_in_progress:
+        return False
+
+    sess = load_session_str()
+    if not sess:
+        client_ready = False
+        state["auth_status"] = "disconnected"
+        state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
+        return False
+
     async with connect_lock:
-        state["phone"] = phone
-        state["auth_status"] = "code_sent"
-        state["auth_msg"] = "در حال ارسال کد... در صورت دریافت کد آن را وارد کنید."
+        if not force_fresh and client_ready:
+            try:
+                t0 = time.perf_counter()
+                await asyncio.wait_for(client.get_me(), timeout=6)
+                state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
+                state["auth_status"] = "connected"
+                return True
+            except Exception:
+                pass
+
         try:
+            if force_fresh or not client_ready:
+                await _close_client_safely(client)
+                client = SoroushClient(StringSession(sess))
+
+            t0 = time.perf_counter()
+            await asyncio.wait_for(client.connect(), timeout=15)
+            me = await asyncio.wait_for(client.get_me(), timeout=10)
+            ms = int((time.perf_counter() - t0) * 1000)
+
+            client_ready = True
+            state["ping"] = f"{ms} ms"
+            state["auth_status"] = "connected"
+            name = getattr(me, "first_name", None) or "اکانت"
+            state["auth_msg"] = f"متصل و فعال: {name}"
+            state["status"] = f"{name} آنلاین و در حال اجراست."
+            return True
+        except Exception as e:
             client_ready = False
+            state["ping"] = "اختلال لحظه‌ای"
+            state["status"] = f"بررسی مجدد اتصال: {e}"
+            return False
+
+
+async def _do_send_code(phone: str):
+    global client, phone_code_hash, login_in_progress, client_ready
+    login_in_progress = True
+    client_ready = False
+    phone_code_hash = None
+    state["phone"] = phone
+    state["auth_status"] = "code_sent"
+    state["auth_msg"] = "در حال ارسال کد..."
+    try:
+        async with connect_lock:
             await _close_client_safely(client)
             client = SoroushClient(StringSession())
             await asyncio.wait_for(client.connect(), timeout=20)
+
+            sent_res = None
             if hasattr(client, "send_code_request"):
-                await client.send_code_request(phone)
+                sent_res = await asyncio.wait_for(client.send_code_request(phone), timeout=20)
             elif hasattr(client, "send_code"):
-                await client.send_code(phone)
+                sent_res = await asyncio.wait_for(client.send_code(phone), timeout=20)
             else:
-                await client.sign_in(phone=phone)
-            state["auth_status"] = "code_sent"
-            state["auth_msg"] = "کد ارسال شد؛ کد را در کادر زیر وارد کنید."
-        except Exception as e:
-            state["auth_status"] = "code_sent"
-            state["auth_msg"] = f"اگر کد آمد وارد کنید (پیام: {e})"
+                sent_res = await asyncio.wait_for(client.sign_in(phone=phone), timeout=20)
+
+            phone_code_hash = _extract_code_hash(sent_res, phone)
+        state["auth_status"] = "code_sent"
+        state["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
+    except Exception as e:
+        state["auth_status"] = "code_sent"
+        state["auth_msg"] = f"خطا در ارسال کد: {e}"
 
 
 async def _do_verify_code(code: str):
-    global force_reconnect
+    global phone_code_hash, login_in_progress, client_ready
     state["auth_status"] = "code_sent"
-    state["auth_msg"] = "در حال بررسی کد..."
+    state["auth_msg"] = "در حال تأیید کد..."
+    phone = state.get("phone", "").strip()
     try:
-        if hasattr(client, "sign_in"):
-            try:
-                await client.sign_in(phone=state["phone"], code=code)
-            except TypeError:
-                await client.sign_in(state["phone"], code)
+        async with connect_lock:
+            if not hasattr(client, "sign_in"):
+                raise RuntimeError("متد sign_in در کلاینت موجود نیست.")
 
-        sess = client.session.save() if getattr(client, "session", None) else ""
-        if not sess:
-            raise RuntimeError("سشن ذخیره نشد؛ کد را دوباره بررسی کنید.")
-        save_session_str(sess)
-        state["auth_status"] = "connected"
-        state["auth_msg"] = "ورود موفق انجام شد؛ در حال اتصال..."
-        force_reconnect = True
+            signed = False
+            last_exc = None
+
+            if phone_code_hash:
+                for call in (
+                    lambda: client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash),
+                    lambda: client.sign_in(phone, code, phone_code_hash),
+                ):
+                    try:
+                        await asyncio.wait_for(call(), timeout=20)
+                        signed = True
+                        break
+                    except TypeError:
+                        continue
+                    except Exception as e:
+                        last_exc = e
+
+            if not signed:
+                try:
+                    await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=20)
+                    signed = True
+                except Exception as e:
+                    last_exc = e
+
+            if not signed:
+                raise RuntimeError(str(last_exc or "ورود ناموفق بود."))
+
+            sess = client.session.save() if getattr(client, "session", None) else ""
+            if not sess:
+                raise RuntimeError("سشن خالی است.")
+
+            save_session_str(sess)
+            phone_code_hash = None
+            login_in_progress = False
+            client_ready = True
+            state["auth_status"] = "connected"
+            state["auth_msg"] = "ورود موفق انجام شد؛ اتصال برقرار است."
+            state["status"] = "متصل و آماده ارسال."
     except Exception as e:
         state["auth_status"] = "code_sent"
         state["auth_msg"] = f"خطا در کد: {e}"
@@ -212,7 +316,7 @@ def run_in_bot_loop(coro):
         asyncio.run_coroutine_threadsafe(coro, bot_loop)
 
 
-# ================= رابط کاربری ساده و مستقیم =================
+# ================= رابط کاربری ساده =================
 PANEL_HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -315,14 +419,14 @@ async function sendPhone(){
   if(!p) return alert('شماره را وارد کن');
   manualCodeBox = true;
   document.getElementById('code_box').style.display = 'block';
-  document.getElementById('auth_msg').innerText = 'در حال ارسال کد... کد را در کادر زیر وارد کنید.';
+  document.getElementById('auth_msg').innerText = 'در حال ارسال کد...';
   await fetch('/api/send_phone?phone=' + encodeURIComponent(p));
   setTimeout(tick, 600);
 }
 async function sendCode(){
   const c = document.getElementById('code').value.trim();
   if(!c) return alert('کد را وارد کن');
-  document.getElementById('auth_msg').innerText = 'در حال بررسی کد...';
+  document.getElementById('auth_msg').innerText = 'در حال تأیید کد...';
   await fetch('/api/verify_code?code=' + encodeURIComponent(c));
   setTimeout(tick, 800);
 }
@@ -442,7 +546,7 @@ def api_send_phone():
     if p:
         state["phone"] = p
         state["auth_status"] = "code_sent"
-        state["auth_msg"] = "در حال ارسال کد... کد را وارد کنید."
+        state["auth_msg"] = "در حال ارسال کد..."
         run_in_bot_loop(_do_send_code(p))
     return "", 200
 
@@ -547,11 +651,13 @@ def run_web():
     app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
 
 
-# ================= موتور پیوسته سلف =================
+# ================= موتور ارسال و نگهداری اتصال پایدار =================
 async def refresh_groups():
     global group_list
     try:
-        dialogs = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=12)
+        if not client_ready:
+            return
+        dialogs = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=10)
         group_list = [
             {"id": d.id, "name": d.name or str(d.id)}
             for d in dialogs
@@ -564,12 +670,12 @@ async def refresh_groups():
 
 
 async def job_worker(job: dict):
-    global force_reconnect
+    global client_ready
     err_count = 0
     while job in spam_jobs:
         try:
             if not job.get("running"):
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.2)
                 continue
 
             mc = int(job.get("max_count") or 0)
@@ -581,28 +687,30 @@ async def job_worker(job: dict):
                 await asyncio.sleep(0.3)
                 continue
 
-            if not client_ready or state.get("auth_status") != "connected":
-                job["last_status"] = "منتظر اتصال زنده سشن..."
-                await asyncio.sleep(1.2)
+            if login_in_progress or not client_ready:
+                job["last_status"] = "در حال حفظ اتصال..."
+                await asyncio.sleep(0.5)
                 continue
 
             t0 = time.perf_counter()
             txts = job.get("texts") or ["تست"]
             i = int(job.get("idx") or 0) % len(txts)
             msg = txts[i]
-            job["idx"] = (i + 1) % len(txts)
 
             t_parsed = parse_target(job["target"])
             peer = int(t_parsed) if t_parsed.lstrip("-").isdigit() else t_parsed
 
-            await asyncio.wait_for(client.send_message(peer, msg), timeout=15)
+            await asyncio.wait_for(client.send_message(peer, msg), timeout=12)
+
+            # فقط پس از موفقیت ارسال، شمارنده و ایندکس را جلو می‌بریم
+            job["idx"] = (i + 1) % len(txts)
             job["sent"] = sent + 1
             job["last_time"] = now_clock()
             job["last_err"] = ""
             job["last_status"] = f"ارسال #{job['sent']}"
             err_count = 0
 
-            if job["sent"] % 15 == 0:
+            if job["sent"] % 10 == 0:
                 save_jobs()
 
             if mc > 0 and job["sent"] >= mc:
@@ -619,11 +727,15 @@ async def job_worker(job: dict):
         except Exception as e:
             err_count += 1
             job["last_err"] = str(e)[:120]
-            job["last_status"] = f"تلاش مجدد ({err_count})"
-            if err_count >= 3:
-                force_reconnect = True
+            job["last_status"] = f"اختلال کوتاه؛ ادامه ({err_count})"
+
+            # اگر اختلال طولانی‌تر شد، نشست را تازه می‌کنیم بدون اینکه تسک متوقف شود
+            if err_count >= 5:
+                client_ready = False
+                await _ensure_live_session(force_fresh=True)
                 err_count = 0
-            await asyncio.sleep(1.5)
+
+            await asyncio.sleep(0.6)
 
 
 async def supervisor_loop():
@@ -641,83 +753,47 @@ async def supervisor_loop():
                     running_tasks[jid] = asyncio.create_task(job_worker(j))
         except Exception:
             pass
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
 
 
-async def connection_loop():
-    global bot_loop, client, force_reconnect, client_ready
-    bot_loop = asyncio.get_running_loop()
-    asyncio.create_task(supervisor_loop())
-
+async def heartbeat_loop():
     while True:
         try:
-            async with connect_lock:
-                force_reconnect = False
-                sess = load_session_str()
-                if not sess:
-                    client_ready = False
-                    state["ping"] = "قطع"
-                    if state.get("auth_status") != "code_sent":
-                        state["auth_status"] = "disconnected"
-                        state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
-                    state["status"] = "منتظر ورود شماره..."
-                    await asyncio.sleep(1.5)
-                    continue
+            if not login_in_progress:
+                ok = await _ensure_live_session(force_fresh=False)
+                if ok and not group_list:
+                    await refresh_groups()
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
-                client_ready = False
-                state["ping"] = "قطع"
-                state["status"] = "در حال برقراری اتصال تازه..."
-                await _close_client_safely(client)
-                client = SoroushClient(StringSession(sess))
 
-                t0 = time.perf_counter()
-                await asyncio.wait_for(client.connect(), timeout=20)
-                if hasattr(client, "is_user_authorized"):
-                    auth_ok = await asyncio.wait_for(client.is_user_authorized(), timeout=12)
-                    if not auth_ok:
-                        raise RuntimeError("نشست/کپ متصل نیست؛ دوباره وارد شوید.")
+async def main_loop():
+    global bot_loop
+    bot_loop = asyncio.get_running_loop()
+    asyncio.create_task(supervisor_loop())
+    asyncio.create_task(heartbeat_loop())
 
-                me = await asyncio.wait_for(client.get_me(), timeout=12)
-                ms = int((time.perf_counter() - t0) * 1000)
+    # تلاش اولیه برای اتصال سریع با سشن ذخیره‌شده
+    await _ensure_live_session(force_fresh=True)
+    await refresh_groups()
 
-                client_ready = True
-                state["ping"] = f"{ms} ms"
-                state["auth_status"] = "connected"
-                name = getattr(me, "first_name", None) or "اکانت"
-                state["auth_msg"] = f"متصل و فعال: {name}"
-                state["status"] = f"{name} آنلاین و آماده ارسال است."
-                await refresh_groups()
+    while True:
+        await asyncio.sleep(1)
 
-            while not force_reconnect:
-                try:
-                    pt0 = time.perf_counter()
-                    await asyncio.wait_for(client.get_me(), timeout=8)
-                    state["ping"] = f"{int((time.perf_counter() - pt0) * 1000)} ms"
-                    state["auth_status"] = "connected"
-                except Exception:
-                    client_ready = False
-                    state["ping"] = "قطع"
-                    state["auth_status"] = "disconnected"
-                    state["auth_msg"] = "اتصال قطع شد؛ در حال اتصال مجدد..."
-                    force_reconnect = True
-                    break
-                await asyncio.sleep(7)
 
-        except Exception as e:
-            client_ready = False
-            state["ping"] = "قطع"
-            if state.get("auth_status") != "code_sent":
-                state["auth_status"] = "disconnected"
-                state["auth_msg"] = f"اتصال قطع است ({e})"
-            state["status"] = f"تلاش برای اتصال مجدد: {e}"
-            await _close_client_safely(client)
-            await asyncio.sleep(3)
+def start_asyncio_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        try:
+            loop.run_until_complete(main_loop())
+        except Exception:
+            time.sleep(1)
 
 
 if __name__ == "__main__":
     Thread(target=run_web, daemon=True).start()
+    Thread(target=start_asyncio_thread, daemon=True).start()
     while True:
-        try:
-            asyncio.run(connection_loop())
-        except Exception:
-            time.sleep(2)
+        time.sleep(1)
