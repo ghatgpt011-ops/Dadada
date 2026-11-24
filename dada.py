@@ -3,10 +3,12 @@ import json
 import logging
 import os
 import re
+import socket
 import time
 from datetime import datetime
 from threading import Thread
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from flask import Flask, request
 from splusthon import SoroushClient
@@ -29,7 +31,7 @@ for _name in ("splusthon", "asyncio"):
 
 accounts_data = {
     "active_id": "",
-    "accounts": [],  # [{"id", "name", "phone", "session", "connected"}]
+    "accounts": [],
 }
 
 spam_jobs = []
@@ -38,16 +40,18 @@ spam_seq = 0
 fwd_seq = 0
 
 state = {
-    "status": "در حال راه‌اندازی اتصال سروش...",
+    "status": "در حال راه‌اندازی...",
+    "net_status": "در حال بررسی نت...",
+    "last_err": "-",
     "ping": "-",
     "last_keepalive": "-",
     "account_name": "بدون اکانت",
-    "auth_status": "disconnected",  # disconnected | code_sent | connected
+    "auth_status": "disconnected",
     "auth_msg": "برای افزودن اکانت جدید، شماره تلفن را وارد کنید (مثال: +98912...)",
     "phone": "",
 }
 
-client = SoroushClient(StringSession())
+client = None
 group_list = []
 bot_loop = None
 phone_code_hash = None
@@ -64,6 +68,45 @@ bot_thread = None
 
 def now_clock() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def set_err(msg: str):
+    state["last_err"] = str(msg or "-")[:200]
+    if msg and msg != "-":
+        print(f"[{now_clock()}] ERR: {state['last_err']}", flush=True)
+
+
+def check_network_access() -> tuple[bool, str]:
+    """بررسی واقعی دسترسی شبکه و اتصال به splus.ir"""
+    proxy_env = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("ALL_PROXY")
+        or ""
+    ).strip()
+
+    try:
+        sock = socket.create_connection(("8.8.8.8", 53), timeout=3)
+        sock.close()
+    except Exception as e:
+        info = f"نت قطع است (عدم دسترسی شبکه: {e})"
+        if proxy_env:
+            info += f" | پراکسی: {proxy_env}"
+        return False, info
+
+    try:
+        req = Request("https://splus.ir", headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=5) as resp:
+            status_code = getattr(resp, "status", 200)
+            msg = f"نت وصل است (splus.ir: {status_code})"
+            if proxy_env:
+                msg += " | با پراکسی"
+            return True, msg
+    except Exception as e:
+        msg = f"شبکه هست ولی اتصال به splus.ir ناموفق است: {e}"
+        if proxy_env:
+            msg += f" | پراکسی: {proxy_env}"
+        return False, msg
 
 
 def is_auth_key_error(err) -> bool:
@@ -107,7 +150,6 @@ def load_accounts():
         except Exception:
             pass
 
-    # مهاجرت سشن قدیمی در صورت وجود
     if not accounts_data["accounts"] and os.path.exists(LEGACY_SESSION_FILE):
         try:
             with open(LEGACY_SESSION_FILE, "r", encoding="utf-8") as f:
@@ -367,7 +409,7 @@ load_accounts()
 load_jobs()
 
 
-# ================= هسته اتصال ۲۴ ساعته سروش =================
+# ================= هسته اتصال سروش =================
 async def _close_client(c):
     if c is None:
         return
@@ -395,7 +437,7 @@ async def _invalidate_session(msg: str = "سشن معتبر نیست؛ شمار�
     group_list = []
     clear_active_session()
     await _close_client(client)
-    client = SoroushClient(StringSession())
+    client = None
     state["ping"] = "قطع"
     if state.get("auth_status") != "code_sent":
         state["auth_status"] = "disconnected"
@@ -410,12 +452,13 @@ def _extract_code_hash(sent_obj, phone: str):
             return str(h)
         if isinstance(sent_obj, dict) and sent_obj.get("phone_code_hash"):
             return str(sent_obj["phone_code_hash"])
-    for attr in ("_phone_code_hash", "phone_code_hash", "code_hash"):
-        val = getattr(client, attr, None)
-        if isinstance(val, dict) and phone in val:
-            return str(val[phone])
-        if isinstance(val, str) and val:
-            return val
+    if client is not None:
+        for attr in ("_phone_code_hash", "phone_code_hash", "code_hash"):
+            val = getattr(client, attr, None)
+            if isinstance(val, dict) and phone in val:
+                return str(val[phone])
+            if isinstance(val, str) and val:
+                return val
     return None
 
 
@@ -423,6 +466,9 @@ async def connect_soroush(force_new: bool = False) -> bool:
     global client, client_ready
     if login_in_progress:
         return False
+
+    net_ok, net_msg = check_network_access()
+    state["net_status"] = net_msg
 
     act = get_active_account()
     sess = get_active_session()
@@ -438,16 +484,17 @@ async def connect_soroush(force_new: bool = False) -> bool:
 
     state["account_name"] = act.get("name") or "اکانت سروش"
 
-    if session_lock.locked():
-        return client_ready
-
-    was_ready = client_ready
+    if not net_ok:
+        client_ready = False
+        state["ping"] = "بدون نت"
+        state["status"] = net_msg
+        return False
 
     async with session_lock:
-        if not force_new and client_ready:
+        if not force_new and client is not None and client_ready:
             try:
                 t0 = time.perf_counter()
-                me = await asyncio.wait_for(client.get_me(), timeout=5)
+                me = await asyncio.wait_for(client.get_me(), timeout=6)
                 ms = int((time.perf_counter() - t0) * 1000)
                 acc_label = _account_label(me)
                 act["name"] = acc_label
@@ -457,6 +504,7 @@ async def connect_soroush(force_new: bool = False) -> bool:
                 state["ping"] = f"{ms} ms"
                 state["auth_status"] = "connected"
                 state["auth_msg"] = f"متصل به سروش: {acc_label}"
+                set_err("-")
                 work = _active_work_summary()
                 state["status"] = (
                     f"دائماً فعال ({acc_label}) | در حال اجرای {work}"
@@ -465,17 +513,19 @@ async def connect_soroush(force_new: bool = False) -> bool:
                 )
                 return True
             except Exception as e:
+                set_err(f"get_me: {type(e).__name__}: {e}")
                 if is_auth_key_error(e):
                     await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                     return False
                 client_ready = False
 
         try:
-            await _close_client(client)
-            client = SoroushClient(StringSession(sess))
+            if force_new or client is None:
+                await _close_client(client)
+                client = SoroushClient(StringSession(sess))
             t0 = time.perf_counter()
-            await asyncio.wait_for(client.connect(), timeout=8)
-            me = await asyncio.wait_for(client.get_me(), timeout=6)
+            await asyncio.wait_for(client.connect(), timeout=12)
+            me = await asyncio.wait_for(client.get_me(), timeout=8)
             ms = int((time.perf_counter() - t0) * 1000)
             acc_label = _account_label(me)
 
@@ -488,27 +538,24 @@ async def connect_soroush(force_new: bool = False) -> bool:
             state["ping"] = f"{ms} ms"
             state["auth_status"] = "connected"
             state["auth_msg"] = f"متصل به سروش: {acc_label}"
+            set_err("-")
             work = _active_work_summary()
-            if not was_ready and work:
-                state["status"] = f"اتصال مجدد برقرار شد؛ ادامه فوری {work}..."
-            elif work:
-                state["status"] = f"دائماً فعال ({acc_label}) | در حال اجرای {work}"
-            else:
-                state["status"] = f"دائماً فعال ({acc_label}) | آماده"
+            state["status"] = (
+                f"دائماً فعال ({acc_label}) | در حال اجرای {work}"
+                if work
+                else f"دائماً فعال ({acc_label}) | آماده"
+            )
             return True
         except Exception as e:
+            err_txt = f"connect: {type(e).__name__}: {e}"
+            set_err(err_txt)
             if is_auth_key_error(e):
                 await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                 return False
             client_ready = False
             act["connected"] = False
-            state["ping"] = "قطع / تلاش مجدد"
-            work = _active_work_summary()
-            state["status"] = (
-                f"ارتباط با سروش قطع است؛ تلاش سریع برای ادامه {work}..."
-                if work
-                else "ارتباط با سروش قطع است؛ تلاش سریع برای اتصال..."
-            )
+            state["ping"] = "قطع"
+            state["status"] = f"خطا در اتصال سروش: {e}"
             return False
 
 
@@ -518,7 +565,9 @@ async def _do_send_code(phone: str):
     client_ready = False
     phone_code_hash = None
 
-    # ایجاد یا انتخاب اکانت برای ورود جدید
+    net_ok, net_msg = check_network_access()
+    state["net_status"] = net_msg
+
     existing = next((a for a in accounts_data["accounts"] if a.get("phone") == phone), None)
     if existing:
         pending_acc_id = existing["id"]
@@ -543,20 +592,22 @@ async def _do_send_code(phone: str):
         async with session_lock:
             await _close_client(client)
             client = SoroushClient(StringSession())
-            await asyncio.wait_for(client.connect(), timeout=10)
+            await asyncio.wait_for(client.connect(), timeout=12)
 
             sent_res = None
             if hasattr(client, "send_code_request"):
-                sent_res = await asyncio.wait_for(client.send_code_request(phone), timeout=10)
+                sent_res = await asyncio.wait_for(client.send_code_request(phone), timeout=12)
             elif hasattr(client, "send_code"):
-                sent_res = await asyncio.wait_for(client.send_code(phone), timeout=10)
+                sent_res = await asyncio.wait_for(client.send_code(phone), timeout=12)
             else:
-                sent_res = await asyncio.wait_for(client.sign_in(phone=phone), timeout=10)
+                sent_res = await asyncio.wait_for(client.sign_in(phone=phone), timeout=12)
 
             phone_code_hash = _extract_code_hash(sent_res, phone)
         state["auth_status"] = "code_sent"
         state["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
+        set_err("-")
     except Exception as e:
+        set_err(f"send_code: {type(e).__name__}: {e}")
         state["auth_status"] = "code_sent"
         state["auth_msg"] = f"خطا در ارسال کد: {e}"
 
@@ -568,8 +619,8 @@ async def _do_verify_code(code: str):
     phone = state.get("phone", "").strip()
     try:
         async with session_lock:
-            if not hasattr(client, "sign_in"):
-                raise RuntimeError("متد sign_in در کلاینت موجود نیست.")
+            if client is None or not hasattr(client, "sign_in"):
+                raise RuntimeError("ابتدا شماره را ارسال کنید.")
 
             signed = False
             last_exc = None
@@ -580,7 +631,7 @@ async def _do_verify_code(code: str):
                     lambda: client.sign_in(phone, code, phone_code_hash),
                 ):
                     try:
-                        await asyncio.wait_for(call(), timeout=10)
+                        await asyncio.wait_for(call(), timeout=12)
                         signed = True
                         break
                     except TypeError:
@@ -590,7 +641,7 @@ async def _do_verify_code(code: str):
 
             if not signed:
                 try:
-                    await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=10)
+                    await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=12)
                     signed = True
                 except Exception as e:
                     last_exc = e
@@ -605,7 +656,7 @@ async def _do_verify_code(code: str):
             acc_label = phone or "اکانت سروش"
             try:
                 t0 = time.perf_counter()
-                me = await asyncio.wait_for(client.get_me(), timeout=6)
+                me = await asyncio.wait_for(client.get_me(), timeout=8)
                 ms = int((time.perf_counter() - t0) * 1000)
                 acc_label = _account_label(me)
                 state["ping"] = f"{ms} ms"
@@ -621,21 +672,25 @@ async def _do_verify_code(code: str):
             state["auth_status"] = "connected"
             state["auth_msg"] = f"متصل به سروش: {acc_label}"
             state["status"] = f"دائماً فعال ({acc_label}) | آماده"
+            set_err("-")
 
         await refresh_groups()
     except Exception as e:
+        set_err(f"verify_code: {type(e).__name__}: {e}")
         state["auth_status"] = "code_sent"
         state["auth_msg"] = f"خطا در کد: {e}"
 
 
 async def _do_switch_account(acc_id: str):
-    global client_ready, group_list, login_in_progress
+    global client, client_ready, group_list, login_in_progress
     target = next((a for a in accounts_data["accounts"] if a.get("id") == acc_id), None)
     if not target:
         return
     login_in_progress = False
     client_ready = False
     group_list = []
+    await _close_client(client)
+    client = None
     accounts_data["active_id"] = acc_id
     save_accounts()
     state["account_name"] = target.get("name") or "اکانت سروش"
@@ -655,7 +710,7 @@ async def _do_delete_account(acc_id: str):
         client_ready = False
         group_list = []
         await _close_client(client)
-        client = SoroushClient(StringSession())
+        client = None
         next_acc = accounts_data["accounts"][0] if accounts_data["accounts"] else None
         accounts_data["active_id"] = next_acc["id"] if next_acc else ""
         save_accounts()
@@ -678,14 +733,14 @@ async def _do_delete_account(acc_id: str):
 
 async def refresh_groups():
     global group_list
-    if not client_ready or session_lock.locked():
+    if not client_ready or client is None:
         return group_list
 
     async with session_lock:
         try:
             raw_dialogs = []
             if hasattr(client, "get_dialogs"):
-                res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=8)
+                res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=10)
                 raw_dialogs = list(res) if res else []
             elif hasattr(client, "iter_dialogs"):
                 async for d in client.iter_dialogs(limit=200):
@@ -710,23 +765,17 @@ async def refresh_groups():
                 j["target_name"] = resolve_name(j.get("target", ""))
             return group_list
         except Exception as e:
+            set_err(f"groups: {type(e).__name__}: {e}")
             if is_auth_key_error(e):
                 await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
             return group_list
 
 
 async def _do_fetch_last10(source_raw: str):
-    if not client_ready:
+    if not client_ready or client is None:
         return {
             "ok": False,
-            "error": "اتصال به سروش قطع است؛ بعد از برقراری اتصال دوباره تلاش کنید.",
-            "messages": [],
-        }
-
-    if session_lock.locked():
-        return {
-            "ok": False,
-            "error": "سیستم در حال بروزرسانی اتصال است؛ چند ثانیه بعد دوباره بزنید.",
+            "error": "اتصال به سروش برقرار نیست.",
             "messages": [],
         }
 
@@ -735,7 +784,7 @@ async def _do_fetch_last10(source_raw: str):
         try:
             raw_msgs = []
             if hasattr(client, "get_messages"):
-                res = await asyncio.wait_for(client.get_messages(peer, limit=10), timeout=8)
+                res = await asyncio.wait_for(client.get_messages(peer, limit=10), timeout=10)
                 raw_msgs = list(res) if res else []
             elif hasattr(client, "iter_messages"):
                 async for m in client.iter_messages(peer, limit=10):
@@ -757,6 +806,7 @@ async def _do_fetch_last10(source_raw: str):
                 })
             return {"ok": True, "error": "", "messages": out}
         except Exception as e:
+            set_err(f"last10: {type(e).__name__}: {e}")
             if is_auth_key_error(e):
                 await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
             return {"ok": False, "error": str(e), "messages": []}
@@ -766,17 +816,18 @@ def run_in_bot_loop(coro):
     if bot_loop and not bot_loop.is_closed():
         try:
             asyncio.run_coroutine_threadsafe(coro, bot_loop)
-        except Exception:
-            pass
+        except Exception as e:
+            set_err(f"loop_submit: {e}")
 
 
-def run_in_bot_loop_wait(coro, timeout=6):
+def run_in_bot_loop_wait(coro, timeout=10):
     if not bot_loop or bot_loop.is_closed():
         return None
     try:
         fut = asyncio.run_coroutine_threadsafe(coro, bot_loop)
         return fut.result(timeout=timeout)
-    except Exception:
+    except Exception as e:
+        set_err(f"loop_wait: {e}")
         return None
 
 
@@ -815,6 +866,8 @@ PANEL_HTML = """<!DOCTYPE html>
 <div class="top-header">
   <div class="top-acc-title">اکانت: <span id="top_acc_name">بدون اکانت</span></div>
   <div class="top-meta">پینگ: <span id="ping">-</span> | پالس ۱۰دقیقه: <span id="ka">-</span></div>
+  <div class="top-meta">نت: <span id="net_st">-</span></div>
+  <div class="top-meta">آخرین خطا: <span id="err_st" dir="ltr">-</span></div>
 </div>
 
 <div class="box">
@@ -1130,6 +1183,8 @@ async function tick(){
     document.getElementById('top_acc_name').innerText = d.account_name || 'بدون اکانت';
     document.getElementById('ping').innerText = d.ping;
     document.getElementById('ka').innerText = d.last_keepalive || '-';
+    document.getElementById('net_st').innerText = d.net_status || '-';
+    document.getElementById('err_st').innerText = d.last_err || '-';
     document.getElementById('status_txt').innerText = d.status;
     document.getElementById('auth_msg').innerText = d.auth_msg;
     if(d.auth_status === 'connected'){ manualCodeBox = false; }
@@ -1306,7 +1361,7 @@ def api_fwd_last10():
             "error": "اتصال به سروش قطع است؛ بعد از برقراری اتصال دوباره تلاش کنید.",
             "messages": [],
         })
-    res = run_in_bot_loop_wait(_do_fetch_last10(src), timeout=6)
+    res = run_in_bot_loop_wait(_do_fetch_last10(src), timeout=8)
     return json_resp(res if isinstance(res, dict) else {"ok": False, "error": "پاسخ دریافت نشد یا اتصال کند است.", "messages": []})
 
 
@@ -1408,6 +1463,8 @@ def api_state():
         "account_name": state["account_name"],
         "active_account_id": accounts_data.get("active_id") or "",
         "accounts": safe_accounts,
+        "net_status": state["net_status"],
+        "last_err": state["last_err"],
         "ping": state["ping"],
         "last_keepalive": state["last_keepalive"],
         "status": state["status"],
@@ -1422,7 +1479,8 @@ def run_web():
     while True:
         try:
             app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
-        except Exception:
+        except Exception as e:
+            set_err(f"web: {e}")
             time.sleep(1)
 
 
@@ -1513,7 +1571,7 @@ async def spam_worker(job: dict):
                 await asyncio.sleep(0.3)
                 continue
 
-            if login_in_progress or not client_ready:
+            if login_in_progress or not client_ready or client is None:
                 job["last_status"] = "در انتظار وصل شدن مجدد به سروش..."
                 await asyncio.sleep(0.6)
                 continue
@@ -1558,6 +1616,7 @@ async def spam_worker(job: dict):
             err_streak += 1
             err_msg = str(e)[:120]
             job["last_err"] = err_msg
+            set_err(f"spam: {err_msg}")
             job["last_status"] = f"اختلال کوتاه؛ ادامه همان اسپم ({err_streak})"
             if err_streak >= 3:
                 client_ready = False
@@ -1583,7 +1642,7 @@ async def forward_worker(job: dict):
                 await asyncio.sleep(0.3)
                 continue
 
-            if login_in_progress or not client_ready:
+            if login_in_progress or not client_ready or client is None:
                 job["last_status"] = "در انتظار وصل شدن مجدد به سروش..."
                 await asyncio.sleep(0.6)
                 continue
@@ -1630,6 +1689,7 @@ async def forward_worker(job: dict):
             err_streak += 1
             err_msg = str(e)[:120]
             job["last_err"] = err_msg
+            set_err(f"fwd: {err_msg}")
             job["last_status"] = f"اختلال کوتاه؛ ادامه همان فوروارد ({err_streak})"
             if err_streak >= 3:
                 client_ready = False
@@ -1657,21 +1717,23 @@ async def supervisor_loop():
             for j in list(forward_jobs):
                 if j["id"] not in fw_tasks:
                     fw_tasks[j["id"]] = asyncio.create_task(forward_worker(j))
-        except Exception:
-            pass
+        except Exception as e:
+            set_err(f"supervisor: {e}")
         await asyncio.sleep(0.35)
 
 
 async def fast_reconnect_loop():
     while True:
         try:
-            if not login_in_progress and get_active_session() and not client_ready:
+            net_ok, net_msg = check_network_access()
+            state["net_status"] = net_msg
+            if net_ok and not login_in_progress and get_active_session() and not client_ready:
                 await connect_soroush(force_new=True)
                 if client_ready and not group_list:
                     await refresh_groups()
-        except Exception:
-            pass
-        await asyncio.sleep(2.5)
+        except Exception as e:
+            set_err(f"reconnect: {e}")
+        await asyncio.sleep(5.0)
 
 
 async def keepalive_10m_loop():
@@ -1684,19 +1746,23 @@ async def keepalive_10m_loop():
             if ok:
                 await refresh_groups()
                 state["last_keepalive"] = now_clock()
-        except Exception:
-            pass
+        except Exception as e:
+            set_err(f"keepalive: {e}")
 
 
 async def main_loop():
     global bot_loop
     bot_loop = asyncio.get_running_loop()
 
+    net_ok, net_msg = check_network_access()
+    state["net_status"] = net_msg
+    print(f"[{now_clock()}] NET: {net_msg}", flush=True)
+
     asyncio.create_task(supervisor_loop())
     asyncio.create_task(fast_reconnect_loop())
     asyncio.create_task(keepalive_10m_loop())
 
-    if get_active_session():
+    if net_ok and get_active_session():
         ok = await connect_soroush(force_new=True)
         if ok:
             await refresh_groups()
@@ -1712,7 +1778,8 @@ def start_bot_thread():
     while True:
         try:
             loop.run_until_complete(main_loop())
-        except Exception:
+        except Exception as e:
+            set_err(f"bot_loop: {e}")
             time.sleep(1)
 
 
@@ -1727,6 +1794,7 @@ def _ensure_threads():
 
 
 if __name__ == "__main__":
+    print(f"[{now_clock()}] Starting web panel on port {PORT} ({PANEL_PATH})", flush=True)
     _ensure_threads()
     while True:
         _ensure_threads()
