@@ -13,7 +13,8 @@ from splusthon import SoroushClient
 from splusthon.sessions import StringSession
 
 # ================= تنظیمات اصلی =================
-SESSION_FILE = "soroush_session.txt"
+ACCOUNTS_FILE = "soroush_accounts.json"
+LEGACY_SESSION_FILE = "soroush_session.txt"
 SPAM_JOBS_FILE = "spam_jobs.json"
 FWD_JOBS_FILE = "forward_jobs.json"
 PORT = int(os.environ.get("PORT", 8080))
@@ -26,17 +27,23 @@ for _name in ("splusthon", "asyncio"):
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
 
+accounts_data = {
+    "active_id": "",
+    "accounts": [],  # [{"id", "name", "phone", "session", "connected"}]
+}
+
 spam_jobs = []
 forward_jobs = []
 spam_seq = 0
 fwd_seq = 0
 
 state = {
-    "status": "حالت دائماً فعال؛ در حال اتصال به سروش...",
+    "status": "در حال راه‌اندازی اتصال سروش...",
     "ping": "-",
     "last_keepalive": "-",
+    "account_name": "بدون اکانت",
     "auth_status": "disconnected",  # disconnected | code_sent | connected
-    "auth_msg": "شماره تلفن اکانت سروش را وارد کنید (مثال: +98912...)",
+    "auth_msg": "برای افزودن اکانت جدید، شماره تلفن را وارد کنید (مثال: +98912...)",
     "phone": "",
 }
 
@@ -44,6 +51,7 @@ client = SoroushClient(StringSession())
 group_list = []
 bot_loop = None
 phone_code_hash = None
+pending_acc_id = None
 login_in_progress = False
 client_ready = False
 
@@ -67,30 +75,101 @@ def is_auth_key_error(err) -> bool:
     )
 
 
-def clear_session():
-    if os.path.exists(SESSION_FILE):
-        try:
-            os.remove(SESSION_FILE)
-        except Exception:
-            pass
+def get_active_account() -> dict | None:
+    aid = accounts_data.get("active_id") or ""
+    for a in accounts_data.get("accounts") or []:
+        if a.get("id") == aid:
+            return a
+    if accounts_data.get("accounts"):
+        first = accounts_data["accounts"][0]
+        accounts_data["active_id"] = first["id"]
+        return first
+    return None
 
 
-def load_session() -> str:
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, "r", encoding="utf-8") as f:
-                return f.read().strip()
-        except Exception:
-            pass
-    return ""
-
-
-def save_session(val: str):
+def save_accounts():
     try:
-        with open(SESSION_FILE, "w", encoding="utf-8") as f:
-            f.write(val or "")
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(accounts_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def load_accounts():
+    global accounts_data
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                if isinstance(raw, dict) and isinstance(raw.get("accounts"), list):
+                    accounts_data["active_id"] = str(raw.get("active_id") or "")
+                    accounts_data["accounts"] = raw["accounts"]
+        except Exception:
+            pass
+
+    # مهاجرت سشن قدیمی در صورت وجود
+    if not accounts_data["accounts"] and os.path.exists(LEGACY_SESSION_FILE):
+        try:
+            with open(LEGACY_SESSION_FILE, "r", encoding="utf-8") as f:
+                old_sess = f.read().strip()
+            if old_sess:
+                acc_id = "acc_legacy"
+                accounts_data["accounts"].append({
+                    "id": acc_id,
+                    "name": "اکانت سروش",
+                    "phone": "",
+                    "session": old_sess,
+                    "connected": False,
+                })
+                accounts_data["active_id"] = acc_id
+                save_accounts()
+        except Exception:
+            pass
+
+    act = get_active_account()
+    if act:
+        state["account_name"] = act.get("name") or "اکانت سروش"
+        state["phone"] = act.get("phone") or ""
+    else:
+        state["account_name"] = "بدون اکانت"
+
+
+def get_active_session() -> str:
+    act = get_active_account()
+    return (act.get("session") or "").strip() if act else ""
+
+
+def set_active_session(sess: str, acc_name: str = "", phone: str = ""):
+    act = get_active_account()
+    if not act:
+        acc_id = f"acc_{int(time.time()*1000)}"
+        act = {
+            "id": acc_id,
+            "name": acc_name or phone or "اکانت سروش",
+            "phone": phone or state.get("phone") or "",
+            "session": sess or "",
+            "connected": bool(sess),
+        }
+        accounts_data["accounts"].append(act)
+        accounts_data["active_id"] = acc_id
+    else:
+        act["session"] = sess or ""
+        act["connected"] = bool(sess)
+        if acc_name:
+            act["name"] = acc_name
+        if phone:
+            act["phone"] = phone
+
+    state["account_name"] = act.get("name") or "اکانت سروش"
+    save_accounts()
+
+
+def clear_active_session():
+    act = get_active_account()
+    if act:
+        act["session"] = ""
+        act["connected"] = False
+        save_accounts()
 
 
 def load_jobs():
@@ -204,7 +283,8 @@ def parse_texts(encoded: str) -> list:
 
 def _account_label(me) -> str:
     if not me:
-        return "اکانت سروش"
+        act = get_active_account()
+        return (act.get("name") if act else "") or "اکانت سروش"
     fn = (getattr(me, "first_name", None) or "").strip()
     ln = (getattr(me, "last_name", None) or "").strip()
     un = (getattr(me, "username", None) or "").strip()
@@ -283,6 +363,7 @@ def _active_work_summary() -> str:
     return " و ".join(items)
 
 
+load_accounts()
 load_jobs()
 
 
@@ -312,7 +393,7 @@ async def _invalidate_session(msg: str = "سشن معتبر نیست؛ شمار�
     global client, client_ready, group_list
     client_ready = False
     group_list = []
-    clear_session()
+    clear_active_session()
     await _close_client(client)
     client = SoroushClient(StringSession())
     state["ping"] = "قطع"
@@ -343,14 +424,19 @@ async def connect_soroush(force_new: bool = False) -> bool:
     if login_in_progress:
         return False
 
-    sess = load_session()
-    if not sess:
+    act = get_active_account()
+    sess = get_active_session()
+    if not act or not sess:
         client_ready = False
         state["ping"] = "قطع"
+        if not act:
+            state["account_name"] = "بدون اکانت"
         if state.get("auth_status") != "code_sent":
             state["auth_status"] = "disconnected"
-            state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
+            state["auth_msg"] = "اکانت فعالی با سشن وجود ندارد؛ شماره را وارد کنید."
         return False
+
+    state["account_name"] = act.get("name") or "اکانت سروش"
 
     if session_lock.locked():
         return client_ready
@@ -363,15 +449,19 @@ async def connect_soroush(force_new: bool = False) -> bool:
                 t0 = time.perf_counter()
                 me = await asyncio.wait_for(client.get_me(), timeout=5)
                 ms = int((time.perf_counter() - t0) * 1000)
-                acc = _account_label(me)
+                acc_label = _account_label(me)
+                act["name"] = acc_label
+                act["connected"] = True
+                save_accounts()
+                state["account_name"] = acc_label
                 state["ping"] = f"{ms} ms"
                 state["auth_status"] = "connected"
-                state["auth_msg"] = f"متصل به سروش: {acc}"
+                state["auth_msg"] = f"متصل به سروش: {acc_label}"
                 work = _active_work_summary()
                 state["status"] = (
-                    f"دائماً فعال ({acc}) | در حال اجرای {work}"
+                    f"دائماً فعال ({acc_label}) | در حال اجرای {work}"
                     if work
-                    else f"دائماً فعال ({acc}) | آماده"
+                    else f"دائماً فعال ({acc_label}) | آماده"
                 )
                 return True
             except Exception as e:
@@ -387,25 +477,31 @@ async def connect_soroush(force_new: bool = False) -> bool:
             await asyncio.wait_for(client.connect(), timeout=8)
             me = await asyncio.wait_for(client.get_me(), timeout=6)
             ms = int((time.perf_counter() - t0) * 1000)
-            acc = _account_label(me)
+            acc_label = _account_label(me)
+
+            act["name"] = acc_label
+            act["connected"] = True
+            save_accounts()
 
             client_ready = True
+            state["account_name"] = acc_label
             state["ping"] = f"{ms} ms"
             state["auth_status"] = "connected"
-            state["auth_msg"] = f"متصل به سروش: {acc}"
+            state["auth_msg"] = f"متصل به سروش: {acc_label}"
             work = _active_work_summary()
             if not was_ready and work:
                 state["status"] = f"اتصال مجدد برقرار شد؛ ادامه فوری {work}..."
             elif work:
-                state["status"] = f"دائماً فعال ({acc}) | در حال اجرای {work}"
+                state["status"] = f"دائماً فعال ({acc_label}) | در حال اجرای {work}"
             else:
-                state["status"] = f"دائماً فعال ({acc}) | آماده"
+                state["status"] = f"دائماً فعال ({acc_label}) | آماده"
             return True
         except Exception as e:
             if is_auth_key_error(e):
                 await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                 return False
             client_ready = False
+            act["connected"] = False
             state["ping"] = "قطع / تلاش مجدد"
             work = _active_work_summary()
             state["status"] = (
@@ -417,12 +513,30 @@ async def connect_soroush(force_new: bool = False) -> bool:
 
 
 async def _do_send_code(phone: str):
-    global client, phone_code_hash, login_in_progress, client_ready
+    global client, phone_code_hash, pending_acc_id, login_in_progress, client_ready
     login_in_progress = True
     client_ready = False
     phone_code_hash = None
-    clear_session()
+
+    # ایجاد یا انتخاب اکانت برای ورود جدید
+    existing = next((a for a in accounts_data["accounts"] if a.get("phone") == phone), None)
+    if existing:
+        pending_acc_id = existing["id"]
+        accounts_data["active_id"] = pending_acc_id
+    else:
+        pending_acc_id = f"acc_{int(time.time()*1000)}"
+        accounts_data["accounts"].append({
+            "id": pending_acc_id,
+            "name": phone,
+            "phone": phone,
+            "session": "",
+            "connected": False,
+        })
+        accounts_data["active_id"] = pending_acc_id
+    save_accounts()
+
     state["phone"] = phone
+    state["account_name"] = phone
     state["auth_status"] = "code_sent"
     state["auth_msg"] = "در حال ارسال کد به سروش..."
     try:
@@ -488,29 +602,78 @@ async def _do_verify_code(code: str):
             if not sess:
                 raise RuntimeError("سشن ذخیره نشد.")
 
-            save_session(sess)
-            phone_code_hash = None
-            login_in_progress = False
-            client_ready = True
-
-            acc = "اکانت سروش"
+            acc_label = phone or "اکانت سروش"
             try:
                 t0 = time.perf_counter()
                 me = await asyncio.wait_for(client.get_me(), timeout=6)
                 ms = int((time.perf_counter() - t0) * 1000)
-                acc = _account_label(me)
+                acc_label = _account_label(me)
                 state["ping"] = f"{ms} ms"
             except Exception:
                 pass
 
+            set_active_session(sess, acc_name=acc_label, phone=phone)
+            phone_code_hash = None
+            login_in_progress = False
+            client_ready = True
+
+            state["account_name"] = acc_label
             state["auth_status"] = "connected"
-            state["auth_msg"] = f"متصل به سروش: {acc}"
-            state["status"] = f"دائماً فعال ({acc}) | آماده"
+            state["auth_msg"] = f"متصل به سروش: {acc_label}"
+            state["status"] = f"دائماً فعال ({acc_label}) | آماده"
 
         await refresh_groups()
     except Exception as e:
         state["auth_status"] = "code_sent"
         state["auth_msg"] = f"خطا در کد: {e}"
+
+
+async def _do_switch_account(acc_id: str):
+    global client_ready, group_list, login_in_progress
+    target = next((a for a in accounts_data["accounts"] if a.get("id") == acc_id), None)
+    if not target:
+        return
+    login_in_progress = False
+    client_ready = False
+    group_list = []
+    accounts_data["active_id"] = acc_id
+    save_accounts()
+    state["account_name"] = target.get("name") or "اکانت سروش"
+    state["phone"] = target.get("phone") or ""
+    state["status"] = f"در حال اتصال به اکانت {state['account_name']}..."
+    await connect_soroush(force_new=True)
+    if client_ready:
+        await refresh_groups()
+
+
+async def _do_delete_account(acc_id: str):
+    global client, client_ready, group_list, login_in_progress
+    was_active = accounts_data.get("active_id") == acc_id
+    accounts_data["accounts"] = [a for a in accounts_data["accounts"] if a.get("id") != acc_id]
+    if was_active:
+        login_in_progress = False
+        client_ready = False
+        group_list = []
+        await _close_client(client)
+        client = SoroushClient(StringSession())
+        next_acc = accounts_data["accounts"][0] if accounts_data["accounts"] else None
+        accounts_data["active_id"] = next_acc["id"] if next_acc else ""
+        save_accounts()
+        if next_acc:
+            state["account_name"] = next_acc.get("name") or "اکانت سروش"
+            state["phone"] = next_acc.get("phone") or ""
+            await connect_soroush(force_new=True)
+            if client_ready:
+                await refresh_groups()
+        else:
+            state["account_name"] = "بدون اکانت"
+            state["phone"] = ""
+            state["ping"] = "قطع"
+            state["auth_status"] = "disconnected"
+            state["auth_msg"] = "اکانت حذف شد؛ شماره جدید را وارد کنید."
+            state["status"] = "هیچ اکانت فعالی ثبت نشده است."
+    else:
+        save_accounts()
 
 
 async def refresh_groups():
@@ -556,7 +719,7 @@ async def _do_fetch_last10(source_raw: str):
     if not client_ready:
         return {
             "ok": False,
-            "error": "اتصال به سروش فعلاً قطع است؛ لیست کش‌شده یا ورود را بررسی کنید.",
+            "error": "اتصال به سروش قطع است؛ بعد از برقراری اتصال دوباره تلاش کنید.",
             "messages": [],
         }
 
@@ -626,6 +789,9 @@ PANEL_HTML = """<!DOCTYPE html>
 <title>پنل سروش</title>
 <style>
   body { font-family: Tahoma, sans-serif; background: #141414; color: #e2e2e2; margin: 0; padding: 12px; }
+  .top-header { max-width: 480px; margin: 0 auto 12px; background: #1f1f1f; border: 1px solid #383838; border-radius: 6px; padding: 10px 12px; }
+  .top-acc-title { font-size: 15px; font-weight: bold; color: #ffffff; }
+  .top-meta { font-size: 11px; color: #b0b0b0; margin-top: 4px; }
   .box { max-width: 480px; margin: 0 auto 12px; background: #1c1c1c; border: 1px solid #333; border-radius: 6px; padding: 12px; }
   h3 { margin: 0 0 10px; font-size: 14px; border-bottom: 1px solid #2e2e2e; padding-bottom: 6px; color: #f0f0f0; }
   label { display: block; font-size: 12px; color: #b0b0b0; margin: 8px 0 4px; }
@@ -641,27 +807,35 @@ PANEL_HTML = """<!DOCTYPE html>
   .small { font-size: 12px; color: #a8a8a8; margin-top: 6px; word-break: break-word; }
   .groups { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; max-height: 95px; overflow-y: auto; }
   .gbtn { width: auto; margin: 0; padding: 4px 8px; font-size: 11px; background: #232323; border: 1px solid #3c3c3c; color: #dcdcdc; }
+  .acc-badge { font-size: 11px; color: #cccccc; border: 1px solid #454545; padding: 1px 6px; border-radius: 4px; }
 </style>
 </head>
 <body>
 
-<div class="box">
-  <h3>دائماً فعال (پینگ: <span id="ping">-</span> | پالس ۱۰دقیقه: <span id="ka">-</span>)</h3>
-  <div id="info_list"><div class="small">موردی ثبت نشده است.</div></div>
-  <div class="small" id="status_txt">-</div>
+<div class="top-header">
+  <div class="top-acc-title">اکانت: <span id="top_acc_name">بدون اکانت</span></div>
+  <div class="top-meta">پینگ: <span id="ping">-</span> | پالس ۱۰دقیقه: <span id="ka">-</span></div>
 </div>
 
 <div class="box">
-  <h3>ورود به اکانت سروش</h3>
-  <label>شماره تلفن:</label>
+  <h3>مدیریت اکانت‌ها</h3>
+  <div id="accounts_list"><div class="small">اکانتی ثبت نشده است.</div></div>
+
+  <label>افزودن اکانت جدید (شماره تلفن):</label>
   <input id="phone" type="text" placeholder="+98912..." dir="ltr">
-  <button onclick="sendPhone()">ارسال کد</button>
+  <button onclick="sendPhone()">افزودن اکانت و ارسال کد</button>
   <div id="code_box" style="display:none; margin-top:8px;">
     <label>کد تأیید:</label>
     <input id="code" type="text" placeholder="12345" dir="ltr">
-    <button onclick="sendCode()">تأیید کد</button>
+    <button onclick="sendCode()">تأیید کد و ثبت اکانت</button>
   </div>
   <div class="small" id="auth_msg">-</div>
+</div>
+
+<div class="box">
+  <h3>وضعیت فعالیت</h3>
+  <div id="info_list"><div class="small">موردی ثبت نشده است.</div></div>
+  <div class="small" id="status_txt">-</div>
 </div>
 
 <div class="box">
@@ -764,6 +938,33 @@ async function sendCode(){
   document.getElementById('auth_msg').innerText = 'در حال تأیید کد...';
   await fetch('/api/verify_code?code=' + encodeURIComponent(c));
   setTimeout(tick, 800);
+}
+async function switchAcc(id){
+  await fetch('/api/accounts/switch?id=' + encodeURIComponent(id));
+  setTimeout(tick, 500);
+}
+async function delAcc(id){
+  await fetch('/api/accounts/del?id=' + encodeURIComponent(id));
+  setTimeout(tick, 500);
+}
+
+function renderAccounts(accs, activeId){
+  const box = document.getElementById('accounts_list');
+  if(!Array.isArray(accs) || !accs.length){
+    box.innerHTML = '<div class="small">اکانتی ثبت نشده است.</div>';
+    return;
+  }
+  box.innerHTML = accs.map(a => {
+    const isAct = a.id === activeId;
+    const statusTxt = a.connected ? 'متصل' : 'در انتظار اتصال';
+    return `<div class="card">
+      <div><b>${esc(a.name || a.phone || 'اکانت')}</b> ${a.phone ? `<span dir="ltr">(${esc(a.phone)})</span>` : ''} <span class="acc-badge">${isAct ? 'فعال' : statusTxt}</span></div>
+      <div class="row">
+        ${!isAct ? `<button type="button" class="mini" onclick="switchAcc('${jsEsc(a.id)}')">انتخاب اکانت</button>` : ''}
+        <button type="button" class="mini" onclick="delAcc('${jsEsc(a.id)}')">حذف اکانت</button>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function applyGroups(arr){
@@ -901,9 +1102,9 @@ function renderAll(jobs, fwds){
       <b>${esc(j.target_name)}</b> — سرعت: ${j.speed}s — متن‌ها: ${(j.texts||[]).length}<br>
       <div class="row">
         ${j.running
-          ? `<button type="button" class="mini" onclick="ctrlJob('${j.id}','pause')">توقف</button>`
-          : `<button type="button" class="mini" onclick="ctrlJob('${j.id}','resume')">ادامه</button>`}
-        <button type="button" class="mini" onclick="ctrlJob('${j.id}','del')">حذف</button>
+          ? `<button type="button" class="mini" onclick="ctrlJob('${jsEsc(j.id)}','pause')">توقف</button>`
+          : `<button type="button" class="mini" onclick="ctrlJob('${jsEsc(j.id)}','resume')">ادامه</button>`}
+        <button type="button" class="mini" onclick="ctrlJob('${jsEsc(j.id)}','del')">حذف</button>
       </div>
     </div>
   `).join('') : '<div class="small">اسپمی ثبت نشده است.</div>';
@@ -914,9 +1115,9 @@ function renderAll(jobs, fwds){
       <div class="small" style="margin-top:2px;">پیام: ${esc(j.msg_summary || ('ID ' + j.msg_id))} — سرعت: ${j.speed}s</div>
       <div class="row">
         ${j.running
-          ? `<button type="button" class="mini" onclick="ctrlFwd('${j.id}','pause')">توقف</button>`
-          : `<button type="button" class="mini" onclick="ctrlFwd('${j.id}','resume')">ادامه</button>`}
-        <button type="button" class="mini" onclick="ctrlFwd('${j.id}','del')">حذف</button>
+          ? `<button type="button" class="mini" onclick="ctrlFwd('${jsEsc(j.id)}','pause')">توقف</button>`
+          : `<button type="button" class="mini" onclick="ctrlFwd('${jsEsc(j.id)}','resume')">ادامه</button>`}
+        <button type="button" class="mini" onclick="ctrlFwd('${jsEsc(j.id)}','del')">حذف</button>
       </div>
     </div>
   `).join('') : '<div class="small">فورواردی ثبت نشده است.</div>';
@@ -926,6 +1127,7 @@ async function tick(){
   try{
     const r = await fetch('/api/state');
     const d = await r.json();
+    document.getElementById('top_acc_name').innerText = d.account_name || 'بدون اکانت';
     document.getElementById('ping').innerText = d.ping;
     document.getElementById('ka').innerText = d.last_keepalive || '-';
     document.getElementById('status_txt').innerText = d.status;
@@ -933,6 +1135,7 @@ async function tick(){
     if(d.auth_status === 'connected'){ manualCodeBox = false; }
     const showCode = manualCodeBox || (d.auth_status === 'code_sent');
     document.getElementById('code_box').style.display = showCode ? 'block' : 'none';
+    renderAccounts(d.accounts || [], d.active_account_id || '');
     renderAll(d.jobs || [], d.forwards || []);
   }catch(e){}
 }
@@ -979,6 +1182,7 @@ def api_send_phone():
     p = (request.args.get("phone") or "").strip()
     if p:
         state["phone"] = p
+        state["account_name"] = p
         state["auth_status"] = "code_sent"
         state["auth_msg"] = "در حال ارسال کد..."
         run_in_bot_loop(_do_send_code(p))
@@ -990,6 +1194,22 @@ def api_verify_code():
     c = (request.args.get("code") or "").strip()
     if c:
         run_in_bot_loop(_do_verify_code(c))
+    return "", 200
+
+
+@app.route("/api/accounts/switch")
+def api_switch_account():
+    aid = (request.args.get("id") or "").strip()
+    if aid:
+        run_in_bot_loop(_do_switch_account(aid))
+    return "", 200
+
+
+@app.route("/api/accounts/del")
+def api_del_account():
+    aid = (request.args.get("id") or "").strip()
+    if aid:
+        run_in_bot_loop(_do_delete_account(aid))
     return "", 200
 
 
@@ -1175,7 +1395,19 @@ def api_fwd_del():
 
 @app.route("/api/state")
 def api_state():
+    safe_accounts = [
+        {
+            "id": a.get("id"),
+            "name": a.get("name"),
+            "phone": a.get("phone"),
+            "connected": bool(a.get("connected")),
+        }
+        for a in (accounts_data.get("accounts") or [])
+    ]
     return json_resp({
+        "account_name": state["account_name"],
+        "active_account_id": accounts_data.get("active_id") or "",
+        "accounts": safe_accounts,
         "ping": state["ping"],
         "last_keepalive": state["last_keepalive"],
         "status": state["status"],
@@ -1433,7 +1665,7 @@ async def supervisor_loop():
 async def fast_reconnect_loop():
     while True:
         try:
-            if not login_in_progress and load_session() and not client_ready:
+            if not login_in_progress and get_active_session() and not client_ready:
                 await connect_soroush(force_new=True)
                 if client_ready and not group_list:
                     await refresh_groups()
@@ -1446,7 +1678,7 @@ async def keepalive_10m_loop():
     while True:
         await asyncio.sleep(600)
         try:
-            if login_in_progress or not load_session():
+            if login_in_progress or not get_active_session():
                 continue
             ok = await connect_soroush(force_new=not client_ready)
             if ok:
@@ -1464,7 +1696,7 @@ async def main_loop():
     asyncio.create_task(fast_reconnect_loop())
     asyncio.create_task(keepalive_10m_loop())
 
-    if load_session():
+    if get_active_session():
         ok = await connect_soroush(force_new=True)
         if ok:
             await refresh_groups()
