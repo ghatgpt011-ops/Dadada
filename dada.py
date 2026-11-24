@@ -12,23 +12,23 @@ from flask import Flask, request
 from splusthon import SoroushClient
 from splusthon.sessions import StringSession
 
-# ================= تنظیمات =================
+# ================= تنظیمات اصلی =================
 SESSION_FILE = "soroush_session.txt"
-JOBS_FILE = "spam_jobs.json"
-FORWARD_JOBS_FILE = "forward_jobs.json"
+SPAM_JOBS_FILE = "spam_jobs.json"
+FWD_JOBS_FILE = "forward_jobs.json"
 PORT = int(os.environ.get("PORT", 8080))
 PANEL_PATH = os.environ.get("PANEL_PATH", "/my-panel")
 if not PANEL_PATH.startswith("/"):
     PANEL_PATH = "/" + PANEL_PATH
 
-for _lg_name in ("splusthon", "asyncio"):
-    _lg = logging.getLogger(_lg_name)
+for _name in ("splusthon", "asyncio"):
+    _lg = logging.getLogger(_name)
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
 
 spam_jobs = []
 forward_jobs = []
-job_seq = 0
+spam_seq = 0
 fwd_seq = 0
 
 state = {
@@ -41,21 +41,20 @@ state = {
 
 client = SoroushClient(StringSession())
 group_list = []
-recent_messages_cache = []
 bot_loop = None
 phone_code_hash = None
 login_in_progress = False
 client_ready = False
 connect_lock = asyncio.Lock()
-send_lock = asyncio.Lock()
+io_lock = asyncio.Lock()
 
 
 def now_clock() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def is_auth_key_error(exc_or_msg) -> bool:
-    s = str(exc_or_msg or "").lower()
+def is_auth_key_error(err) -> bool:
+    s = str(err or "").lower()
     return (
         "authkeyunregistered" in s
         or "key is not registered" in s
@@ -63,7 +62,7 @@ def is_auth_key_error(exc_or_msg) -> bool:
     )
 
 
-def clear_session_file():
+def clear_session():
     if os.path.exists(SESSION_FILE):
         try:
             os.remove(SESSION_FILE)
@@ -71,7 +70,7 @@ def clear_session_file():
             pass
 
 
-def load_session_str() -> str:
+def load_session() -> str:
     if os.path.exists(SESSION_FILE):
         try:
             with open(SESSION_FILE, "r", encoding="utf-8") as f:
@@ -81,19 +80,20 @@ def load_session_str() -> str:
     return ""
 
 
-def save_session_str(s: str):
+def save_session(val: str):
     try:
         with open(SESSION_FILE, "w", encoding="utf-8") as f:
-            f.write(s or "")
+            f.write(val or "")
     except Exception:
         pass
 
 
-def load_jobs():
-    global spam_jobs, forward_jobs, job_seq, fwd_seq
-    if os.path.exists(JOBS_FILE):
+def load_all_jobs():
+    global spam_jobs, forward_jobs, spam_seq, fwd_seq
+
+    if os.path.exists(SPAM_JOBS_FILE):
         try:
-            with open(JOBS_FILE, "r", encoding="utf-8") as f:
+            with open(SPAM_JOBS_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
                 if isinstance(raw, list):
                     spam_jobs = raw
@@ -101,17 +101,17 @@ def load_jobs():
                         j["idx"] = int(j.get("idx") or 0)
                         j["sent"] = int(j.get("sent") or 0)
                         j["max_count"] = int(j.get("max_count") or 0)
-                        j["speed"] = max(0.01, float(j.get("speed") or 1.0))
+                        j["speed"] = max(0.05, float(j.get("speed") or 1.0))
                         if j.get("running"):
-                            j["last_status"] = "ادامه خودکار اسپم..."
+                            j["last_status"] = "بازیابی تسک و ادامه..."
                             j["last_err"] = ""
-                    job_seq = len(spam_jobs)
+                    spam_seq = len(spam_jobs)
         except Exception:
             pass
 
-    if os.path.exists(FORWARD_JOBS_FILE):
+    if os.path.exists(FWD_JOBS_FILE):
         try:
-            with open(FORWARD_JOBS_FILE, "r", encoding="utf-8") as f:
+            with open(FWD_JOBS_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
                 if isinstance(raw, list):
                     forward_jobs = raw
@@ -120,24 +120,24 @@ def load_jobs():
                         j["max_count"] = int(j.get("max_count") or 0)
                         j["speed"] = max(0.05, float(j.get("speed") or 1.0))
                         if j.get("running"):
-                            j["last_status"] = "ادامه خودکار فوروارد..."
+                            j["last_status"] = "بازیابی فوروارد و ادامه..."
                             j["last_err"] = ""
                     fwd_seq = len(forward_jobs)
         except Exception:
             pass
 
 
-def save_jobs():
+def save_spam_jobs():
     try:
-        with open(JOBS_FILE, "w", encoding="utf-8") as f:
+        with open(SPAM_JOBS_FILE, "w", encoding="utf-8") as f:
             json.dump(spam_jobs, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
-def save_forward_jobs():
+def save_fwd_jobs():
     try:
-        with open(FORWARD_JOBS_FILE, "w", encoding="utf-8") as f:
+        with open(FWD_JOBS_FILE, "w", encoding="utf-8") as f:
             json.dump(forward_jobs, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
@@ -174,7 +174,7 @@ def to_peer(target: str):
     return int(t) if t.lstrip("-").isdigit() else t
 
 
-def resolve_group_name(target: str) -> str:
+def resolve_name(target: str) -> str:
     t = str(target).strip()
     for g in group_list:
         if str(g.get("id")) == t or str(g.get("name")) == t:
@@ -195,6 +195,21 @@ def parse_texts(encoded: str) -> list:
     except Exception:
         pass
     return [txt.strip()] if txt.strip() else []
+
+
+def _extract_account_name(me) -> str:
+    if not me:
+        return "اکانت"
+    fn = (getattr(me, "first_name", None) or "").strip()
+    ln = (getattr(me, "last_name", None) or "").strip()
+    un = (getattr(me, "username", None) or "").strip()
+    full = f"{fn} {ln}".strip()
+    if full:
+        return full
+    if un:
+        return f"@{un}"
+    uid = getattr(me, "id", None)
+    return str(uid) if uid is not None else "اکانت"
 
 
 def _extract_dialog_info(d):
@@ -252,10 +267,10 @@ def _extract_msg_id(m, fallback_idx: int) -> int:
     return fallback_idx
 
 
-load_jobs()
+load_all_jobs()
 
 
-# ================= مدیریت کلاینت و لاگین =================
+# ================= مدیریت اتصال پایدار =================
 async def _close_client_safely(c):
     if c is None:
         return
@@ -277,18 +292,18 @@ async def _close_client_safely(c):
             pass
 
 
-async def _handle_dead_session(reason: str = "سشن معتبر نیست؛ شماره و کد جدید وارد کنید."):
+async def _reset_invalid_session(msg: str = "سشن معتبر نیست؛ شماره و کد جدید وارد کنید."):
     global client, client_ready, group_list
     client_ready = False
     group_list = []
-    clear_session_file()
+    clear_session()
     await _close_client_safely(client)
     client = SoroushClient(StringSession())
     state["ping"] = "قطع"
     if state.get("auth_status") != "code_sent":
         state["auth_status"] = "disconnected"
-    state["auth_msg"] = reason
-    state["status"] = reason
+    state["auth_msg"] = msg
+    state["status"] = msg
 
 
 def _extract_code_hash(sent_obj, phone: str):
@@ -307,55 +322,59 @@ def _extract_code_hash(sent_obj, phone: str):
     return None
 
 
-async def _ensure_live_session(force_fresh: bool = False) -> bool:
+async def ensure_connected(force_rebuild: bool = False) -> bool:
     global client, client_ready
     if login_in_progress:
         return False
 
-    sess = load_session_str()
+    sess = load_session()
     if not sess:
         client_ready = False
-        state["auth_status"] = "disconnected"
-        state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
+        state["ping"] = "قطع"
+        if state.get("auth_status") != "code_sent":
+            state["auth_status"] = "disconnected"
+            state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
         return False
 
     async with connect_lock:
-        if not force_fresh and client_ready:
+        if not force_rebuild and client_ready:
             try:
                 t0 = time.perf_counter()
-                await asyncio.wait_for(client.get_me(), timeout=6)
-                state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
+                me = await asyncio.wait_for(client.get_me(), timeout=7)
+                ms = int((time.perf_counter() - t0) * 1000)
+                acc_name = _extract_account_name(me)
+                state["ping"] = f"{ms} ms"
                 state["auth_status"] = "connected"
+                state["auth_msg"] = f"متصل و فعال: {acc_name}"
+                state["status"] = f"{acc_name} آنلاین و در حال اجراست."
                 return True
             except Exception as e:
                 if is_auth_key_error(e):
-                    await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+                    await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                     return False
 
         try:
-            if force_fresh or not client_ready:
-                await _close_client_safely(client)
-                client = SoroushClient(StringSession(sess))
-
+            await _close_client_safely(client)
+            client = SoroushClient(StringSession(sess))
             t0 = time.perf_counter()
-            await asyncio.wait_for(client.connect(), timeout=15)
-            me = await asyncio.wait_for(client.get_me(), timeout=10)
+            await asyncio.wait_for(client.connect(), timeout=16)
+            me = await asyncio.wait_for(client.get_me(), timeout=12)
             ms = int((time.perf_counter() - t0) * 1000)
+            acc_name = _extract_account_name(me)
 
             client_ready = True
             state["ping"] = f"{ms} ms"
             state["auth_status"] = "connected"
-            name = getattr(me, "first_name", None) or "اکانت"
-            state["auth_msg"] = f"متصل و فعال: {name}"
-            state["status"] = f"{name} آنلاین و در حال اجراست."
+            state["auth_msg"] = f"متصل و فعال: {acc_name}"
+            state["status"] = f"{acc_name} آنلاین و در حال اجراست."
             return True
         except Exception as e:
             if is_auth_key_error(e):
-                await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+                await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                 return False
             client_ready = False
             state["ping"] = "اختلال لحظه‌ای"
-            state["status"] = f"بررسی مجدد اتصال: {e}"
+            state["status"] = f"در حال حفظ اتصال و تلاش مجدد: {e}"
             return False
 
 
@@ -364,7 +383,7 @@ async def _do_send_code(phone: str):
     login_in_progress = True
     client_ready = False
     phone_code_hash = None
-    clear_session_file()
+    clear_session()
     state["phone"] = phone
     state["auth_status"] = "code_sent"
     state["auth_msg"] = "در حال ارسال کد..."
@@ -429,27 +448,77 @@ async def _do_verify_code(code: str):
 
             sess = client.session.save() if getattr(client, "session", None) else ""
             if not sess:
-                raise RuntimeError("سشن خالی است.")
+                raise RuntimeError("سشن ذخیره نشد.")
 
-            save_session_str(sess)
+            save_session(sess)
             phone_code_hash = None
             login_in_progress = False
             client_ready = True
+
+            acc_name = "اکانت"
+            try:
+                t0 = time.perf_counter()
+                me = await asyncio.wait_for(client.get_me(), timeout=10)
+                ms = int((time.perf_counter() - t0) * 1000)
+                acc_name = _extract_account_name(me)
+                state["ping"] = f"{ms} ms"
+            except Exception:
+                pass
+
             state["auth_status"] = "connected"
-            state["auth_msg"] = "ورود موفق انجام شد؛ اتصال برقرار است."
-            state["status"] = "متصل و آماده ارسال و فوروارد."
-            await refresh_groups()
+            state["auth_msg"] = f"متصل و فعال: {acc_name}"
+            state["status"] = f"{acc_name} آنلاین و در حال اجراست."
+
+        await refresh_groups()
     except Exception as e:
         state["auth_status"] = "code_sent"
         state["auth_msg"] = f"خطا در کد: {e}"
 
 
-async def _do_fetch_last10(source_raw: str):
-    global recent_messages_cache
-    ok = await _ensure_live_session(force_fresh=False)
+async def refresh_groups():
+    global group_list
+    ok = await ensure_connected(force_rebuild=False)
     if not ok:
-        recent_messages_cache = []
-        return {"ok": False, "error": state.get("auth_msg") or "حساب متصل نیست.", "messages": []}
+        return group_list
+
+    async with connect_lock:
+        try:
+            raw_dialogs = []
+            if hasattr(client, "get_dialogs"):
+                res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=15)
+                raw_dialogs = list(res) if res else []
+            elif hasattr(client, "iter_dialogs"):
+                async for d in client.iter_dialogs(limit=200):
+                    raw_dialogs.append(d)
+
+            gc_items = []
+            all_items = []
+            for d in raw_dialogs:
+                info = _extract_dialog_info(d)
+                if not info:
+                    continue
+                item = {"id": info["id"], "name": info["name"], "type": info["type"]}
+                all_items.append(item)
+                if info["is_gc"]:
+                    gc_items.append(item)
+
+            group_list = gc_items if gc_items else all_items
+            for j in spam_jobs:
+                j["target_name"] = resolve_name(j["target"])
+            for j in forward_jobs:
+                j["source_name"] = resolve_name(j.get("source", ""))
+                j["target_name"] = resolve_name(j.get("target", ""))
+            return group_list
+        except Exception as e:
+            if is_auth_key_error(e):
+                await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+            return group_list
+
+
+async def _do_fetch_last10(source_raw: str):
+    ok = await ensure_connected(force_rebuild=False)
+    if not ok:
+        return {"ok": False, "error": state.get("auth_msg") or "اتصال برقرار نیست.", "messages": []}
 
     peer = to_peer(source_raw)
     async with connect_lock:
@@ -462,31 +531,33 @@ async def _do_fetch_last10(source_raw: str):
                 async for m in client.iter_messages(peer, limit=10):
                     raw_msgs.append(m)
             else:
-                raise RuntimeError("متد دریافت پیام‌ها در کلاینت یافت نشد.")
+                raise RuntimeError("امکان خواندن پیام‌ها در کلاینت وجود ندارد.")
 
-            parsed = []
+            out = []
             for idx, m in enumerate(raw_msgs):
                 mid = _extract_msg_id(m, idx + 1)
                 full_text = _extract_msg_text(m) or "[پیام مدیا / بدون متن]"
                 one_line = " ".join(full_text.splitlines()).strip()
                 summary = (one_line[:75] + "...") if len(one_line) > 75 else one_line
-                parsed.append({
+                out.append({
                     "index": idx + 1,
                     "id": mid,
                     "summary": summary,
                     "text": full_text,
                 })
-
-            recent_messages_cache = parsed
-            return {"ok": True, "error": "", "messages": parsed}
+            return {"ok": True, "error": "", "messages": out}
         except Exception as e:
             if is_auth_key_error(e):
-                await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
-            recent_messages_cache = []
+                await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
             return {"ok": False, "error": str(e), "messages": []}
 
 
-def run_in_bot_loop_and_wait(coro, timeout=18):
+def run_in_bot_loop(coro):
+    if bot_loop and not bot_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(coro, bot_loop)
+
+
+def run_in_bot_loop_wait(coro, timeout=18):
     if not bot_loop or bot_loop.is_closed():
         return None
     fut = asyncio.run_coroutine_threadsafe(coro, bot_loop)
@@ -496,12 +567,7 @@ def run_in_bot_loop_and_wait(coro, timeout=18):
         return None
 
 
-def run_in_bot_loop(coro):
-    if bot_loop and not bot_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(coro, bot_loop)
-
-
-# ================= رابط کاربری پنل اسپم + فوروارد =================
+# ================= رابط کاربری پنل =================
 PANEL_HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
@@ -532,8 +598,8 @@ PANEL_HTML = """<!DOCTYPE html>
 <body>
 
 <div class="box">
-  <h3>اطلاعات اسپم و فوروارد (پینگ: <span id="ping">-</span>)</h3>
-  <div id="info_list"><div class="small">تسک فعالی ثبت نشده است.</div></div>
+  <h3>اطلاعات اجرا و اتصال (پینگ: <span id="ping">-</span>)</h3>
+  <div id="info_list"><div class="small">مأموریتی ثبت نشده است.</div></div>
   <div class="small" id="status_txt">-</div>
 </div>
 
@@ -568,7 +634,7 @@ PANEL_HTML = """<!DOCTYPE html>
   <button type="button" onclick="addText()">افزودن متن دیگر</button>
 
   <label>سرعت (ثانیه بین هر ارسال):</label>
-  <input id="speed" type="number" value="1" step="0.05" min="0.01">
+  <input id="speed" type="number" value="1" step="0.05" min="0.05">
 
   <label>تعداد ارسال (0 = نامحدود):</label>
   <input id="max_count" type="number" value="0" step="1" min="0">
@@ -775,7 +841,7 @@ function renderAll(jobs, fwds){
   });
 
   const allLive = spamCards.concat(fwdCards);
-  info.innerHTML = allLive.length ? allLive.join('') : '<div class="small">تسک فعالی ثبت نشده است.</div>';
+  info.innerHTML = allLive.length ? allLive.join('') : '<div class="small">مأموریتی ثبت نشده است.</div>';
 
   list.innerHTML = (jobs || []).length ? (jobs || []).map(j => `
     <div class="card">
@@ -876,18 +942,18 @@ def api_verify_code():
 @app.route("/api/groups")
 def api_groups():
     if client_ready and not group_list:
-        run_in_bot_loop_and_wait(refresh_groups(), timeout=15)
+        run_in_bot_loop_wait(refresh_groups(), timeout=15)
     return json_resp(group_list)
 
 
 @app.route("/api/add_job")
 def api_add_job():
-    global job_seq
+    global spam_seq
     raw_t = (request.args.get("target") or "").strip()
     tgt = parse_target(raw_t)
     txts = parse_texts(request.args.get("texts") or "")
     try:
-        spd = max(0.01, float(request.args.get("speed") or "1"))
+        spd = max(0.05, float(request.args.get("speed") or "1"))
     except Exception:
         spd = 1.0
     try:
@@ -898,11 +964,11 @@ def api_add_job():
     if not tgt or not txts:
         return json_resp({"ok": False, "msg": "مقصد یا متن معتبر نیست."})
 
-    job_seq += 1
+    spam_seq += 1
     job = {
-        "id": f"j_{job_seq}_{int(time.time()*1000)%10000}",
+        "id": f"sp_{spam_seq}_{int(time.time()*1000)%10000}",
         "target": tgt,
-        "target_name": resolve_group_name(tgt),
+        "target_name": resolve_name(tgt),
         "texts": txts,
         "idx": 0,
         "speed": spd,
@@ -914,8 +980,8 @@ def api_add_job():
         "last_status": "در حال شروع",
     }
     spam_jobs.append(job)
-    save_jobs()
-    state["status"] = f"اسپم روی {job['target_name']} شروع شد."
+    save_spam_jobs()
+    state["status"] = f"مأموریت اسپم روی {job['target_name']} ثبت شد."
     return json_resp({"ok": True, "msg": "اسپم اضافه شد."})
 
 
@@ -926,7 +992,7 @@ def api_pause_job():
         if j["id"] == jid:
             j["running"] = False
             j["last_status"] = "متوقف"
-    save_jobs()
+    save_spam_jobs()
     return "", 200
 
 
@@ -939,8 +1005,8 @@ def api_resume_job():
                 j["sent"] = 0
             j["running"] = True
             j["last_err"] = ""
-            j["last_status"] = "در حال ارسال"
-    save_jobs()
+            j["last_status"] = "در حال ادامه..."
+    save_spam_jobs()
     return "", 200
 
 
@@ -948,14 +1014,14 @@ def api_resume_job():
 def api_del_job():
     jid = (request.args.get("id") or "").strip()
     spam_jobs[:] = [j for j in spam_jobs if j["id"] != jid]
-    save_jobs()
+    save_spam_jobs()
     return "", 200
 
 
 @app.route("/api/forward/last10")
 def api_fwd_last10():
     src = (request.args.get("source") or "").strip()
-    res = run_in_bot_loop_and_wait(_do_fetch_last10(src), timeout=18)
+    res = run_in_bot_loop_wait(_do_fetch_last10(src), timeout=18)
     return json_resp(res if isinstance(res, dict) else {"ok": False, "error": "پاسخ دریافت نشد.", "messages": []})
 
 
@@ -986,11 +1052,11 @@ def api_fwd_add():
 
     fwd_seq += 1
     job = {
-        "id": f"fwd_{fwd_seq}_{int(time.time()*1000)%10000}",
+        "id": f"fw_{fwd_seq}_{int(time.time()*1000)%10000}",
         "source": src,
-        "source_name": resolve_group_name(src),
+        "source_name": resolve_name(src),
         "target": tgt,
-        "target_name": resolve_group_name(tgt),
+        "target_name": resolve_name(tgt),
         "msg_id": msg_id,
         "msg_text": raw_txt,
         "msg_summary": summary,
@@ -1003,8 +1069,8 @@ def api_fwd_add():
         "last_status": "در حال شروع",
     }
     forward_jobs.append(job)
-    save_forward_jobs()
-    state["status"] = f"فوروارد از {job['source_name']} به {job['target_name']} شروع شد."
+    save_fwd_jobs()
+    state["status"] = f"مأموریت فوروارد از {job['source_name']} به {job['target_name']} ثبت شد."
     return json_resp({"ok": True, "msg": "فوروارد اضافه شد."})
 
 
@@ -1015,7 +1081,7 @@ def api_fwd_pause():
         if j["id"] == jid:
             j["running"] = False
             j["last_status"] = "متوقف"
-    save_forward_jobs()
+    save_fwd_jobs()
     return "", 200
 
 
@@ -1029,8 +1095,8 @@ def api_fwd_resume():
                 j["sent"] = 0
             j["running"] = True
             j["last_err"] = ""
-            j["last_status"] = "در حال فوروارد"
-    save_forward_jobs()
+            j["last_status"] = "در حال ادامه..."
+    save_fwd_jobs()
     return "", 200
 
 
@@ -1038,7 +1104,7 @@ def api_fwd_resume():
 def api_fwd_del():
     jid = (request.args.get("id") or "").strip()
     forward_jobs[:] = [j for j in forward_jobs if j["id"] != jid]
-    save_forward_jobs()
+    save_fwd_jobs()
     return "", 200
 
 
@@ -1058,120 +1124,13 @@ def run_web():
     app.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True)
 
 
-# ================= موتور ارسال، فوروارد و نگهداری اتصال پایدار =================
-async def refresh_groups():
-    global group_list
-    try:
-        if not client_ready:
-            return
-        raw_dialogs = []
-        if hasattr(client, "get_dialogs"):
-            res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=12)
-            raw_dialogs = list(res) if res else []
-        elif hasattr(client, "iter_dialogs"):
-            async for d in client.iter_dialogs(limit=200):
-                raw_dialogs.append(d)
-
-        gc_items = []
-        all_items = []
-        for d in raw_dialogs:
-            info = _extract_dialog_info(d)
-            if not info:
-                continue
-            clean = {"id": info["id"], "name": info["name"], "type": info["type"]}
-            all_items.append(clean)
-            if info["is_gc"]:
-                gc_items.append(clean)
-
-        group_list = gc_items if gc_items else all_items
-        for j in spam_jobs:
-            j["target_name"] = resolve_group_name(j["target"])
-        for j in forward_jobs:
-            j["source_name"] = resolve_group_name(j.get("source", ""))
-            j["target_name"] = resolve_group_name(j.get("target", ""))
-    except Exception as e:
-        if is_auth_key_error(e):
-            await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+# ================= موتور اجرای پیوسته و بازیابی خودکار =================
+async def _send_spam_message(peer, msg: str):
+    async with io_lock:
+        return await asyncio.wait_for(client.send_message(peer, msg), timeout=12)
 
 
-async def job_worker(job: dict):
-    global client_ready
-    err_count = 0
-    while job in spam_jobs:
-        try:
-            if not job.get("running"):
-                await asyncio.sleep(0.2)
-                continue
-
-            mc = int(job.get("max_count") or 0)
-            sent = int(job.get("sent") or 0)
-            if mc > 0 and sent >= mc:
-                job["running"] = False
-                job["last_status"] = f"تمام شد ({mc})"
-                save_jobs()
-                await asyncio.sleep(0.3)
-                continue
-
-            if login_in_progress or not client_ready:
-                job["last_status"] = "در حال حفظ اتصال..."
-                await asyncio.sleep(0.5)
-                continue
-
-            t0 = time.perf_counter()
-            txts = job.get("texts") or ["تست"]
-            i = int(job.get("idx") or 0) % len(txts)
-            msg = txts[i]
-
-            t_parsed = parse_target(job["target"])
-            peer = int(t_parsed) if t_parsed.lstrip("-").isdigit() else t_parsed
-
-            async with send_lock:
-                await asyncio.wait_for(client.send_message(peer, msg), timeout=12)
-
-            job["idx"] = (i + 1) % len(txts)
-            job["sent"] = sent + 1
-            job["last_time"] = now_clock()
-            job["last_err"] = ""
-            job["last_status"] = f"ارسال #{job['sent']}"
-            err_count = 0
-
-            if job["sent"] % 10 == 0:
-                save_jobs()
-
-            if mc > 0 and job["sent"] >= mc:
-                job["running"] = False
-                job["last_status"] = f"تمام شد ({mc}/{mc})"
-                save_jobs()
-                continue
-
-            elapsed = time.perf_counter() - t0
-            spd = max(0.01, float(job.get("speed") or 1.0))
-            if spd - elapsed > 0:
-                await asyncio.sleep(spd - elapsed)
-
-        except Exception as e:
-            if is_auth_key_error(e):
-                await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
-                job["last_err"] = "AuthKeyUnregisteredError"
-                job["last_status"] = "نیاز به ورود مجدد"
-                await asyncio.sleep(2.0)
-                continue
-
-            err_count += 1
-            err_str = str(e)[:120]
-            job["last_err"] = err_str
-            job["last_status"] = f"اختلال کوتاه؛ ادامه ({err_count})"
-
-            pause_sec = 2.0 if "list index out of range" in err_str.lower() else 0.6
-            if err_count >= 5:
-                client_ready = False
-                await _ensure_live_session(force_fresh=True)
-                err_count = 0
-
-            await asyncio.sleep(pause_sec)
-
-
-async def _resolve_fallback_text(src_peer, msg_id_val, fallback_text: str) -> str:
+async def _resolve_fwd_fallback_text(src_peer, msg_id_val, fallback_text: str) -> str:
     txt = (fallback_text or "").strip()
     if txt and txt != "[پیام مدیا / بدون متن]":
         return txt
@@ -1188,22 +1147,22 @@ async def _resolve_fallback_text(src_peer, msg_id_val, fallback_text: str) -> st
     return txt or f"پیام #{msg_id_val}"
 
 
-async def _send_forward_once(src_peer, tgt_peer, msg_id_str: str, fallback_text: str):
+async def _send_forward_message(src_peer, tgt_peer, msg_id_str: str, fallback_text: str):
     msg_id_val = int(msg_id_str) if str(msg_id_str).isdigit() else msg_id_str
 
-    async with send_lock:
+    async with io_lock:
         fwd_err = None
         if hasattr(client, "forward_messages"):
             try:
                 return await asyncio.wait_for(
                     client.forward_messages(tgt_peer, msg_id_val, from_peer=src_peer),
-                    timeout=15,
+                    timeout=14,
                 )
             except TypeError:
                 try:
                     return await asyncio.wait_for(
                         client.forward_messages(tgt_peer, msg_id_val, src_peer),
-                        timeout=15,
+                        timeout=14,
                     )
                 except Exception as e:
                     fwd_err = e
@@ -1214,32 +1173,103 @@ async def _send_forward_once(src_peer, tgt_peer, msg_id_str: str, fallback_text:
             try:
                 return await asyncio.wait_for(
                     client.forward_message(tgt_peer, msg_id_val, from_peer=src_peer),
-                    timeout=15,
+                    timeout=14,
                 )
             except TypeError:
                 try:
                     return await asyncio.wait_for(
                         client.forward_message(tgt_peer, msg_id_val, src_peer),
-                        timeout=15,
+                        timeout=14,
                     )
                 except Exception as e:
                     fwd_err = e
             except Exception as e:
                 fwd_err = e
 
-        if fwd_err is not None:
-            if is_auth_key_error(fwd_err):
-                raise fwd_err
-            text_to_send = await _resolve_fallback_text(src_peer, msg_id_val, fallback_text)
-            return await asyncio.wait_for(client.send_message(tgt_peer, text_to_send), timeout=15)
+        if fwd_err is not None and is_auth_key_error(fwd_err):
+            raise fwd_err
 
-        text_to_send = await _resolve_fallback_text(src_peer, msg_id_val, fallback_text)
-        return await asyncio.wait_for(client.send_message(tgt_peer, text_to_send), timeout=15)
+        text_to_send = await _resolve_fwd_fallback_text(src_peer, msg_id_val, fallback_text)
+        return await asyncio.wait_for(client.send_message(tgt_peer, text_to_send), timeout=14)
+
+
+async def spam_worker(job: dict):
+    global client_ready
+    err_streak = 0
+    while job in spam_jobs:
+        try:
+            if not job.get("running"):
+                await asyncio.sleep(0.25)
+                continue
+
+            mc = int(job.get("max_count") or 0)
+            sent = int(job.get("sent") or 0)
+            if mc > 0 and sent >= mc:
+                job["running"] = False
+                job["last_status"] = f"تمام شد ({mc})"
+                save_spam_jobs()
+                await asyncio.sleep(0.3)
+                continue
+
+            if login_in_progress or not client_ready:
+                job["last_status"] = "بازیابی اتصال؛ منتظر..."
+                await asyncio.sleep(0.6)
+                continue
+
+            t0 = time.perf_counter()
+            txts = job.get("texts") or ["تست"]
+            i = int(job.get("idx") or 0) % len(txts)
+            msg = txts[i]
+            peer = to_peer(job["target"])
+
+            await _send_spam_message(peer, msg)
+
+            # تنها پس از موفقیت واقعی ارسال، ایندکس و شمارنده را جلو می‌بریم
+            job["idx"] = (i + 1) % len(txts)
+            job["sent"] = sent + 1
+            job["last_time"] = now_clock()
+            job["last_err"] = ""
+            job["last_status"] = f"ارسال #{job['sent']}"
+            err_streak = 0
+
+            if job["sent"] % 10 == 0:
+                save_spam_jobs()
+
+            if mc > 0 and job["sent"] >= mc:
+                job["running"] = False
+                job["last_status"] = f"تمام شد ({mc}/{mc})"
+                save_spam_jobs()
+                continue
+
+            elapsed = time.perf_counter() - t0
+            spd = max(0.05, float(job.get("speed") or 1.0))
+            if spd - elapsed > 0:
+                await asyncio.sleep(spd - elapsed)
+
+        except Exception as e:
+            if is_auth_key_error(e):
+                await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+                job["last_err"] = "AuthKeyUnregisteredError"
+                job["last_status"] = "نیاز به ورود مجدد"
+                await asyncio.sleep(2.0)
+                continue
+
+            err_streak += 1
+            err_msg = str(e)[:120]
+            job["last_err"] = err_msg
+            job["last_status"] = f"اختلال کوتاه؛ ادامه همان پیام ({err_streak})"
+
+            sleep_sec = 2.0 if "list index out of range" in err_msg.lower() else 0.6
+            if err_streak >= 6:
+                client_ready = False
+                await ensure_connected(force_rebuild=True)
+                err_streak = 0
+            await asyncio.sleep(sleep_sec)
 
 
 async def forward_worker(job: dict):
     global client_ready
-    err_count = 0
+    err_streak = 0
     while job in forward_jobs:
         try:
             if not job.get("running"):
@@ -1251,12 +1281,12 @@ async def forward_worker(job: dict):
             if mc > 0 and sent >= mc:
                 job["running"] = False
                 job["last_status"] = f"تمام شد ({mc})"
-                save_forward_jobs()
+                save_fwd_jobs()
                 await asyncio.sleep(0.3)
                 continue
 
             if login_in_progress or not client_ready:
-                job["last_status"] = "در حال حفظ اتصال..."
+                job["last_status"] = "بازیابی اتصال؛ منتظر..."
                 await asyncio.sleep(0.6)
                 continue
 
@@ -1264,7 +1294,7 @@ async def forward_worker(job: dict):
             src_peer = to_peer(job["source"])
             tgt_peer = to_peer(job["target"])
 
-            await _send_forward_once(
+            await _send_forward_message(
                 src_peer,
                 tgt_peer,
                 str(job.get("msg_id") or ""),
@@ -1275,15 +1305,15 @@ async def forward_worker(job: dict):
             job["last_time"] = now_clock()
             job["last_err"] = ""
             job["last_status"] = f"فوروارد #{job['sent']}"
-            err_count = 0
+            err_streak = 0
 
             if job["sent"] % 10 == 0:
-                save_forward_jobs()
+                save_fwd_jobs()
 
             if mc > 0 and job["sent"] >= mc:
                 job["running"] = False
                 job["last_status"] = f"تمام شد ({mc}/{mc})"
-                save_forward_jobs()
+                save_fwd_jobs()
                 continue
 
             elapsed = time.perf_counter() - t0
@@ -1293,63 +1323,60 @@ async def forward_worker(job: dict):
 
         except Exception as e:
             if is_auth_key_error(e):
-                await _handle_dead_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
+                await _reset_invalid_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                 job["last_err"] = "AuthKeyUnregisteredError"
                 job["last_status"] = "نیاز به ورود مجدد"
                 await asyncio.sleep(2.0)
                 continue
 
-            err_count += 1
-            err_str = str(e)[:120]
-            job["last_err"] = err_str
-            job["last_status"] = f"اختلال کوتاه؛ ادامه ({err_count})"
+            err_streak += 1
+            err_msg = str(e)[:120]
+            job["last_err"] = err_msg
+            job["last_status"] = f"اختلال کوتاه؛ ادامه فوروارد ({err_streak})"
 
-            pause_sec = 2.0 if "list index out of range" in err_str.lower() else 0.7
-            if err_count >= 5:
+            sleep_sec = 2.0 if "list index out of range" in err_msg.lower() else 0.7
+            if err_streak >= 6:
                 client_ready = False
-                await _ensure_live_session(force_fresh=True)
-                err_count = 0
-
-            await asyncio.sleep(pause_sec)
+                await ensure_connected(force_rebuild=True)
+                err_streak = 0
+            await asyncio.sleep(sleep_sec)
 
 
 async def supervisor_loop():
-    spam_tasks = {}
-    fwd_tasks = {}
+    sp_tasks = {}
+    fw_tasks = {}
     while True:
         try:
-            active_spam_ids = {j["id"] for j in spam_jobs}
-            for jid in list(spam_tasks.keys()):
-                if jid not in active_spam_ids or spam_tasks[jid].done():
-                    spam_tasks.pop(jid, None)
+            active_sp = {j["id"] for j in spam_jobs}
+            for jid in list(sp_tasks.keys()):
+                if jid not in active_sp or sp_tasks[jid].done():
+                    sp_tasks.pop(jid, None)
             for j in list(spam_jobs):
-                jid = j["id"]
-                if jid not in spam_tasks:
-                    spam_tasks[jid] = asyncio.create_task(job_worker(j))
+                if j["id"] not in sp_tasks:
+                    sp_tasks[j["id"]] = asyncio.create_task(spam_worker(j))
 
-            active_fwd_ids = {j["id"] for j in forward_jobs}
-            for jid in list(fwd_tasks.keys()):
-                if jid not in active_fwd_ids or fwd_tasks[jid].done():
-                    fwd_tasks.pop(jid, None)
+            active_fw = {j["id"] for j in forward_jobs}
+            for jid in list(fw_tasks.keys()):
+                if jid not in active_fw or fw_tasks[jid].done():
+                    fw_tasks.pop(jid, None)
             for j in list(forward_jobs):
-                jid = j["id"]
-                if jid not in fwd_tasks:
-                    fwd_tasks[jid] = asyncio.create_task(forward_worker(j))
+                if j["id"] not in fw_tasks:
+                    fw_tasks[j["id"]] = asyncio.create_task(forward_worker(j))
         except Exception:
             pass
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.35)
 
 
 async def heartbeat_loop():
     while True:
         try:
             if not login_in_progress:
-                ok = await _ensure_live_session(force_fresh=False)
+                ok = await ensure_connected(force_rebuild=False)
                 if ok and not group_list:
                     await refresh_groups()
         except Exception:
             pass
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
 
 
 async def main_loop():
@@ -1358,14 +1385,15 @@ async def main_loop():
     asyncio.create_task(supervisor_loop())
     asyncio.create_task(heartbeat_loop())
 
-    await _ensure_live_session(force_fresh=True)
-    await refresh_groups()
+    await ensure_connected(force_rebuild=True)
+    if client_ready:
+        await refresh_groups()
 
     while True:
         await asyncio.sleep(1)
 
 
-def start_asyncio_thread():
+def start_bot_thread():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     while True:
@@ -1377,6 +1405,6 @@ def start_asyncio_thread():
 
 if __name__ == "__main__":
     Thread(target=run_web, daemon=True).start()
-    Thread(target=start_asyncio_thread, daemon=True).start()
+    Thread(target=start_bot_thread, daemon=True).start()
     while True:
         time.sleep(1)
