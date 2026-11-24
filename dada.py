@@ -26,17 +26,15 @@ for _name in ("splusthon", "asyncio"):
     _lg.setLevel(logging.CRITICAL)
     _lg.propagate = False
 
-# ساختار اکانت‌ها: [{"id": "acc_1", "phone": "+98...", "name": "...", "session": "...", "ready": False, "ping": "-", "status": "..."}]
 accounts = []
 active_account_id = ""
 acc_seq = 0
 
-# کلاینت‌ها و قفل‌ها به ازای هر اکانت
-clients_map = {}      # acc_id -> SoroushClient
-groups_map = {}       # acc_id -> list[dict]
-io_locks = {}         # acc_id -> asyncio.Lock
-connect_locks = {}    # acc_id -> asyncio.Lock
-last_keepalive = {}   # acc_id -> monotonic timestamp
+clients_map = {}
+groups_map = {}
+io_locks = {}
+connect_locks = {}
+last_keepalive = {}
 
 spam_jobs = []
 forward_jobs = []
@@ -48,7 +46,7 @@ pending_login = {
     "phone": "",
     "code_hash": None,
     "in_progress": False,
-    "auth_status": "idle",  # idle | code_sent | connected
+    "auth_status": "idle",
     "auth_msg": "شماره تلفن را وارد کنید (مثال: +98912...)",
 }
 
@@ -429,7 +427,6 @@ async def _do_send_code(phone: str):
     pending_login["auth_status"] = "code_sent"
     pending_login["auth_msg"] = "در حال ارسال کد..."
 
-    # پیدا کردن یا ساخت اکانت موقت/جدید
     target_acc = next((a for a in accounts if a.get("phone") == phone), None)
     if not target_acc:
         acc_seq += 1
