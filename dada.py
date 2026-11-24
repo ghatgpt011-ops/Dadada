@@ -296,14 +296,14 @@ async def _close_client(c):
             try:
                 res = sub.close()
                 if asyncio.iscoroutine(res):
-                    await res
+                    await asyncio.wait_for(res, timeout=2)
             except Exception:
                 pass
     if hasattr(c, "disconnect"):
         try:
             res = c.disconnect()
             if asyncio.iscoroutine(res):
-                await res
+                await asyncio.wait_for(res, timeout=2)
         except Exception:
             pass
 
@@ -352,13 +352,16 @@ async def connect_soroush(force_new: bool = False) -> bool:
             state["auth_msg"] = "سشن وجود ندارد؛ شماره را وارد کنید."
         return False
 
+    if session_lock.locked():
+        return client_ready
+
     was_ready = client_ready
 
     async with session_lock:
         if not force_new and client_ready:
             try:
                 t0 = time.perf_counter()
-                me = await asyncio.wait_for(client.get_me(), timeout=8)
+                me = await asyncio.wait_for(client.get_me(), timeout=5)
                 ms = int((time.perf_counter() - t0) * 1000)
                 acc = _account_label(me)
                 state["ping"] = f"{ms} ms"
@@ -381,8 +384,8 @@ async def connect_soroush(force_new: bool = False) -> bool:
             await _close_client(client)
             client = SoroushClient(StringSession(sess))
             t0 = time.perf_counter()
-            await asyncio.wait_for(client.connect(), timeout=18)
-            me = await asyncio.wait_for(client.get_me(), timeout=12)
+            await asyncio.wait_for(client.connect(), timeout=8)
+            me = await asyncio.wait_for(client.get_me(), timeout=6)
             ms = int((time.perf_counter() - t0) * 1000)
             acc = _account_label(me)
 
@@ -403,12 +406,12 @@ async def connect_soroush(force_new: bool = False) -> bool:
                 await _invalidate_session("سشن معتبر نیست؛ شماره و کد جدید وارد کنید.")
                 return False
             client_ready = False
-            state["ping"] = "در حال اتصال..."
+            state["ping"] = "قطع / تلاش مجدد"
             work = _active_work_summary()
             state["status"] = (
-                f"اتصال مختل شد؛ بازاتصال سریع برای {work}..."
+                f"ارتباط با سروش قطع است؛ تلاش سریع برای ادامه {work}..."
                 if work
-                else f"اتصال مختل شد؛ تلاش مجدد: {e}"
+                else "ارتباط با سروش قطع است؛ تلاش سریع برای اتصال..."
             )
             return False
 
@@ -426,15 +429,15 @@ async def _do_send_code(phone: str):
         async with session_lock:
             await _close_client(client)
             client = SoroushClient(StringSession())
-            await asyncio.wait_for(client.connect(), timeout=20)
+            await asyncio.wait_for(client.connect(), timeout=10)
 
             sent_res = None
             if hasattr(client, "send_code_request"):
-                sent_res = await asyncio.wait_for(client.send_code_request(phone), timeout=20)
+                sent_res = await asyncio.wait_for(client.send_code_request(phone), timeout=10)
             elif hasattr(client, "send_code"):
-                sent_res = await asyncio.wait_for(client.send_code(phone), timeout=20)
+                sent_res = await asyncio.wait_for(client.send_code(phone), timeout=10)
             else:
-                sent_res = await asyncio.wait_for(client.sign_in(phone=phone), timeout=20)
+                sent_res = await asyncio.wait_for(client.sign_in(phone=phone), timeout=10)
 
             phone_code_hash = _extract_code_hash(sent_res, phone)
         state["auth_status"] = "code_sent"
@@ -463,7 +466,7 @@ async def _do_verify_code(code: str):
                     lambda: client.sign_in(phone, code, phone_code_hash),
                 ):
                     try:
-                        await asyncio.wait_for(call(), timeout=20)
+                        await asyncio.wait_for(call(), timeout=10)
                         signed = True
                         break
                     except TypeError:
@@ -473,7 +476,7 @@ async def _do_verify_code(code: str):
 
             if not signed:
                 try:
-                    await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=20)
+                    await asyncio.wait_for(client.sign_in(phone=phone, code=code), timeout=10)
                     signed = True
                 except Exception as e:
                     last_exc = e
@@ -493,7 +496,7 @@ async def _do_verify_code(code: str):
             acc = "اکانت سروش"
             try:
                 t0 = time.perf_counter()
-                me = await asyncio.wait_for(client.get_me(), timeout=10)
+                me = await asyncio.wait_for(client.get_me(), timeout=6)
                 ms = int((time.perf_counter() - t0) * 1000)
                 acc = _account_label(me)
                 state["ping"] = f"{ms} ms"
@@ -512,14 +515,14 @@ async def _do_verify_code(code: str):
 
 async def refresh_groups():
     global group_list
-    if not client_ready:
+    if not client_ready or session_lock.locked():
         return group_list
 
     async with session_lock:
         try:
             raw_dialogs = []
             if hasattr(client, "get_dialogs"):
-                res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=15)
+                res = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=8)
                 raw_dialogs = list(res) if res else []
             elif hasattr(client, "iter_dialogs"):
                 async for d in client.iter_dialogs(limit=200):
@@ -551,16 +554,25 @@ async def refresh_groups():
 
 async def _do_fetch_last10(source_raw: str):
     if not client_ready:
-        await connect_soroush(force_new=False)
-    if not client_ready:
-        return {"ok": False, "error": state.get("auth_msg") or "اتصال سروش برقرار نیست.", "messages": []}
+        return {
+            "ok": False,
+            "error": "اتصال به سروش فعلاً قطع است؛ لیست کش‌شده یا ورود را بررسی کنید.",
+            "messages": [],
+        }
+
+    if session_lock.locked():
+        return {
+            "ok": False,
+            "error": "سیستم در حال بروزرسانی اتصال است؛ چند ثانیه بعد دوباره بزنید.",
+            "messages": [],
+        }
 
     peer = to_peer(source_raw)
     async with session_lock:
         try:
             raw_msgs = []
             if hasattr(client, "get_messages"):
-                res = await asyncio.wait_for(client.get_messages(peer, limit=10), timeout=15)
+                res = await asyncio.wait_for(client.get_messages(peer, limit=10), timeout=8)
                 raw_msgs = list(res) if res else []
             elif hasattr(client, "iter_messages"):
                 async for m in client.iter_messages(peer, limit=10):
@@ -589,14 +601,17 @@ async def _do_fetch_last10(source_raw: str):
 
 def run_in_bot_loop(coro):
     if bot_loop and not bot_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(coro, bot_loop)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, bot_loop)
+        except Exception:
+            pass
 
 
-def run_in_bot_loop_wait(coro, timeout=18):
+def run_in_bot_loop_wait(coro, timeout=6):
     if not bot_loop or bot_loop.is_closed():
         return None
-    fut = asyncio.run_coroutine_threadsafe(coro, bot_loop)
     try:
+        fut = asyncio.run_coroutine_threadsafe(coro, bot_loop)
         return fut.result(timeout=timeout)
     except Exception:
         return None
@@ -756,7 +771,7 @@ function applyGroups(arr){
   const sBox = document.getElementById('fwd_src_groups');
   const tBox = document.getElementById('fwd_tgt_groups');
   if(!Array.isArray(arr) || !arr.length){
-    const empty = '<span class="small">موردی یافت نشد</span>';
+    const empty = '<span class="small">لیستی ثبت نشده یا اتصال به سروش قطع است</span>';
     gBox.innerHTML = empty;
     sBox.innerHTML = empty;
     tBox.innerHTML = empty;
@@ -774,10 +789,14 @@ function applyGroups(arr){
 }
 
 async function loadGroups(){
-  document.getElementById('groups').innerHTML = '<span class="small">در حال دریافت...</span>';
-  const r = await fetch('/api/groups');
-  const arr = await r.json();
-  applyGroups(arr);
+  document.getElementById('groups').innerHTML = '<span class="small">در حال بررسی...</span>';
+  try {
+    const r = await fetch('/api/groups');
+    const arr = await r.json();
+    applyGroups(arr);
+  } catch(e) {
+    applyGroups([]);
+  }
 }
 
 function pickFwdMsg(el, mid, fullText, summary){
@@ -808,7 +827,7 @@ async function loadLast10(){
       </div>`;
     }).join('');
   } catch(e) {
-    box.innerHTML = '<div class="small">خطا در دریافت پیام‌ها.</div>';
+    box.innerHTML = '<div class="small">ارتباط با سرور یا سروش در دسترس نیست.</div>';
   }
 }
 
@@ -977,8 +996,13 @@ def api_verify_code():
 @app.route("/api/groups")
 def api_groups():
     if client_ready and not group_list:
-        run_in_bot_loop_wait(refresh_groups(), timeout=15)
+        run_in_bot_loop(_maybe_refresh_groups())
     return json_resp(group_list)
+
+
+async def _maybe_refresh_groups():
+    if not group_list and client_ready:
+        await refresh_groups()
 
 
 @app.route("/api/add_job")
@@ -1056,8 +1080,14 @@ def api_del_job():
 @app.route("/api/forward/last10")
 def api_fwd_last10():
     src = (request.args.get("source") or "").strip()
-    res = run_in_bot_loop_wait(_do_fetch_last10(src), timeout=18)
-    return json_resp(res if isinstance(res, dict) else {"ok": False, "error": "پاسخ دریافت نشد.", "messages": []})
+    if not client_ready:
+        return json_resp({
+            "ok": False,
+            "error": "اتصال به سروش قطع است؛ بعد از برقراری اتصال دوباره تلاش کنید.",
+            "messages": [],
+        })
+    res = run_in_bot_loop_wait(_do_fetch_last10(src), timeout=6)
+    return json_resp(res if isinstance(res, dict) else {"ok": False, "error": "پاسخ دریافت نشد یا اتصال کند است.", "messages": []})
 
 
 @app.route("/api/forward/add")
@@ -1167,7 +1197,7 @@ def run_web():
 # ================= ارسال اسپم، فوروارد و پالس ۱۰ دقیقه‌ای =================
 async def _send_spam_once(peer, msg: str):
     async with send_lock:
-        return await asyncio.wait_for(client.send_message(peer, msg), timeout=12)
+        return await asyncio.wait_for(client.send_message(peer, msg), timeout=8)
 
 
 async def _resolve_fwd_text(src_peer, msg_id_val, fallback_text: str) -> str:
@@ -1176,7 +1206,7 @@ async def _resolve_fwd_text(src_peer, msg_id_val, fallback_text: str) -> str:
         return txt
     if hasattr(client, "get_messages"):
         try:
-            res = await asyncio.wait_for(client.get_messages(src_peer, ids=msg_id_val), timeout=10)
+            res = await asyncio.wait_for(client.get_messages(src_peer, ids=msg_id_val), timeout=6)
             if res:
                 first = res[0] if isinstance(res, (list, tuple)) else res
                 extracted = _msg_text(first)
@@ -1196,13 +1226,13 @@ async def _send_fwd_once(src_peer, tgt_peer, msg_id_str: str, fallback_text: str
             try:
                 return await asyncio.wait_for(
                     client.forward_messages(tgt_peer, msg_id_val, from_peer=src_peer),
-                    timeout=14,
+                    timeout=9,
                 )
             except TypeError:
                 try:
                     return await asyncio.wait_for(
                         client.forward_messages(tgt_peer, msg_id_val, src_peer),
-                        timeout=14,
+                        timeout=9,
                     )
                 except Exception as e:
                     fwd_err = e
@@ -1213,13 +1243,13 @@ async def _send_fwd_once(src_peer, tgt_peer, msg_id_str: str, fallback_text: str
             try:
                 return await asyncio.wait_for(
                     client.forward_message(tgt_peer, msg_id_val, from_peer=src_peer),
-                    timeout=14,
+                    timeout=9,
                 )
             except TypeError:
                 try:
                     return await asyncio.wait_for(
                         client.forward_message(tgt_peer, msg_id_val, src_peer),
-                        timeout=14,
+                        timeout=9,
                     )
                 except Exception as e:
                     fwd_err = e
@@ -1230,7 +1260,7 @@ async def _send_fwd_once(src_peer, tgt_peer, msg_id_str: str, fallback_text: str
             raise fwd_err
 
         text_to_send = await _resolve_fwd_text(src_peer, msg_id_val, fallback_text)
-        return await asyncio.wait_for(client.send_message(tgt_peer, text_to_send), timeout=14)
+        return await asyncio.wait_for(client.send_message(tgt_peer, text_to_send), timeout=9)
 
 
 async def spam_worker(job: dict):
@@ -1297,7 +1327,7 @@ async def spam_worker(job: dict):
             err_msg = str(e)[:120]
             job["last_err"] = err_msg
             job["last_status"] = f"اختلال کوتاه؛ ادامه همان اسپم ({err_streak})"
-            if err_streak >= 4:
+            if err_streak >= 3:
                 client_ready = False
                 err_streak = 0
             await asyncio.sleep(0.7)
@@ -1369,7 +1399,7 @@ async def forward_worker(job: dict):
             err_msg = str(e)[:120]
             job["last_err"] = err_msg
             job["last_status"] = f"اختلال کوتاه؛ ادامه همان فوروارد ({err_streak})"
-            if err_streak >= 4:
+            if err_streak >= 3:
                 client_ready = False
                 err_streak = 0
             await asyncio.sleep(0.8)
@@ -1409,7 +1439,7 @@ async def fast_reconnect_loop():
                     await refresh_groups()
         except Exception:
             pass
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(2.5)
 
 
 async def keepalive_10m_loop():
